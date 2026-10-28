@@ -9,6 +9,7 @@ use App\Model\Bill;
 use App\Model\Business;
 use App\Model\BusinessLevel;
 use App\Model\Card;
+use App\Model\CardFile;
 use App\Model\Commodity;
 use App\Model\CommodityGroup;
 use App\Model\Config;
@@ -20,6 +21,7 @@ use App\Model\UserCommodity;
 use App\Model\UserGroup;
 use App\Service\Email;
 use App\Service\Shared;
+use App\Util\CardFile\Link;
 use App\Util\Client;
 use App\Util\Currency;
 use App\Util\Date;
@@ -27,6 +29,8 @@ use App\Util\Ini;
 use App\Util\PayConfig;
 use App\Util\PayFactory;
 use App\Util\PayProfile;
+use App\Util\PurchaseLimit;
+use App\Util\Sku;
 use App\Util\Str;
 use Illuminate\Database\Capsule\Manager as DB;
 use Kernel\Annotation\Inject;
@@ -61,6 +65,7 @@ class Order implements \App\Service\Order
         'level_price',
         'level_disable',
         'config',
+        'substation_disable',
     ];
 
     public const CALLBACK_REJECT = "fail";
@@ -89,7 +94,8 @@ class Order implements \App\Service\Order
         $this->parseConfig($commodity, $group);
         $config = (array)$commodity->config;
 
-        $price = $owner == 0 ? $commodity->price : $commodity->user_price;
+        //会员价留空(0)时回退零售价，避免"忘填会员价 = 登录用户 0 元白嫖"
+        $price = $owner == 0 ? $commodity->price : $commodity->memberPrice();
 
         if (!empty($race) && isset($config['category'][$race])) {
             $price = (float)$config['category'][$race];
@@ -152,8 +158,15 @@ class Order implements \App\Service\Order
             throw new JSONException("商品不存在#1");
         }
 
+        //数量必须为正。虽然 trade() 已有 num<=0 守卫，但 valuation() 也被前台询价/插件下单等路径调用，
+        //负数量会算出负价（前台展示 -6.66，且负价会命中 amount<=0 分支→免支付直发），这里统一兜底。
+        if ($num <= 0) {
+            throw new JSONException("至少购买1个");
+        }
+
         $commodity = clone $commodity;
-        $price = (new Decimal($group ? $commodity->user_price : $commodity->price, 2));
+        //会员价留空(0)时回退零售价，避免"忘填会员价 = 登录用户 0 元白嫖"
+        $price = (new Decimal($group ? $commodity->memberPrice() : $commodity->price, 2));
 
         $levelPrice = $this->userDefinedPrice($commodity, $group);
         if ($levelPrice && $levelPrice['amount'] > 0 && $levelPrice['amount'] < $price->getAmount()) {
@@ -220,11 +233,12 @@ class Order implements \App\Service\Order
         if (!empty($cardId) && $commodity->draft_status == 1 && $num == 1) {
             $shop = Di::inst()->make(\App\Service\Shop::class);
 
+            //卡号必须正是所选的种类与规格（对接商品把规格带给上游一起确认），否则按便宜规格报出贵卡的价
             if ($commodity->shared) {
-                $draft = $this->shared->getDraft($commodity->shared, $commodity->shared_code, $cardId);
+                $draft = $this->shared->getDraft($commodity->shared, $commodity->shared_code, $cardId, (string)$race, $sku ?: []);
                 $draftPremium = $draft['draft_premium'] > 0 ? $this->shared->AdjustmentExtra($commodity, $draft['draft_premium']) : 0;
             } else {
-                $draft = $shop->getDraft($commodity, $cardId);
+                $draft = $shop->getDraft($commodity, $cardId, (string)$race, $sku ?: []);
                 $draftPremium = $draft['draft_premium'];
             }
 
@@ -235,11 +249,9 @@ class Order implements \App\Service\Order
             }
         }
 
-        if ($commodity->level_disable == 1) {
-            return $price->mul($num)->getAmount();
-        }
-
-        if ($group && is_array($group->discount_config)) {
+        //会员等级折扣禁用（level_disable）只跳过「会员分组折扣」，不影响优惠券——历史上这里直接 return，
+        //把下面整段优惠券校验也一并跳过了，导致带券的 level_disable 商品可绕过归属校验。
+        if ($commodity->level_disable != 1 && $group && is_array($group->discount_config)) {
             $discountConfig = $group->discount_config;
             asort($discountConfig);
             $commodityGroups = CommodityGroup::query()->whereIn("id", array_keys($discountConfig))->get();
@@ -252,62 +264,72 @@ class Order implements \App\Service\Order
             }
         }
 
-        if (!empty($coupon) && $num == 1) {
+        //优惠券：无论会员等级折扣是否禁用、无论购买数量，只要带了券就必须完整校验（商品券开关 + 单件限制 +
+        //归属 + 适用性 + 状态 + 过期）再抵扣。历史上「level_disable 提前 return」与「仅 $num==1 才校验」会把归属
+        //等校验整段跳过，而下单事务仍照常消耗券 → 任意会员可用 num>=2 或 level_disable 商品烧掉他人商户的券
+        //（跨租户授权绕过）。归属/适用性校验收敛到 assertCouponApplicable，报价与消耗两处共用同一套口径。
+        if (!empty($coupon)) {
+            if ((int)$commodity->coupon !== 1) {
+                throw new JSONException("该商品不支持使用优惠券");
+            }
+            if ($num != 1) {
+                throw new JSONException("优惠券仅限购买单件商品时使用");
+            }
             $voucher = Coupon::query()->where("code", $coupon)->first();
-
             if (!$voucher) {
                 throw new JSONException("该优惠券不存在");
             }
+            $this->assertCouponApplicable($voucher, $commodity, $race, $sku);
 
-            if ($voucher->owner != $commodity->owner) {
-                throw new JSONException("该优惠券不存在");
-            }
-
-            if ($voucher->commodity_id != 0 && $voucher->commodity_id != $commodity->id) {
-                throw new JSONException("该优惠券不属于该商品");
-            }
-
-            if ($voucher->race && $voucher->commodity_id != 0 && $race != $voucher->race) {
-                throw new JSONException("该优惠券不能抵扣当前商品");
-            }
-
-            if ($voucher->sku && is_array($voucher->sku) && $voucher->commodity_id != 0) {
-                if (!is_array($sku)) {
-                    throw new JSONException("此优惠券不适用当前商品");
-                }
-
-                foreach ($voucher->sku as $key => $sk) {
-                    if (!isset($sku[$key])) {
-                        throw new JSONException("此优惠券不适用此SKU");
-                    }
-
-                    if ($sk != $sku[$key]) {
-                        throw new JSONException("此优惠券不适用此SKU{$sku[$key]}");
-                    }
-                }
-            }
-
-            if ($voucher->commodity_id == 0 && $voucher->category_id != 0 && $voucher->category_id != $commodity->category_id) {
-                throw new JSONException("该优惠券不能抵扣当前商品");
-            }
-
-            if ($voucher->status != 0) {
-                throw new JSONException("该优惠券已失效");
-            }
-
-            if ($voucher->expire_time != null && strtotime($voucher->expire_time) < time()) {
-                throw new JSONException("该优惠券已过期");
-            }
-
-            if ($voucher->mode == 0 && $voucher->money >= $price->getAmount()) {
-                return "0";
-            }
-
-            $deduction = $voucher->mode == 0 ? $voucher->money : $price->mul($voucher->money)->getAmount();
-            $price = $price->sub($deduction);
+            $deduction = $voucher->mode == 0
+                ? (new Decimal($voucher->money, 2))->getAmount()
+                : $price->mul($voucher->money)->getAmount();
+            $price = bccomp($deduction, $price->getAmount(), 2) >= 0
+                ? new Decimal("0", 2)
+                : $price->sub($deduction);
         }
 
         return $price->mul($num)->getAmount();
+    }
+
+    /**
+     * 优惠券对「本次商品 / SKU / 品类 / 归属 / 状态 / 有效期」的适用性校验——报价(valuation)、下单消耗、
+     * 金额预览三处共用同一套口径，确保「校验通过」与「允许消耗」永远一致（本次跨租户烧券绕过正源于三份
+     * 校验各走各的）。不含数量(num)与商品券开关(commodity.coupon)判断，那两项由各调用点按场景另行把关。
+     */
+    private function assertCouponApplicable(Coupon $voucher, Commodity $commodity, ?string $race, ?array $sku): void
+    {
+        if ($voucher->owner != $commodity->owner) {
+            throw new JSONException("该优惠券不存在");
+        }
+        if ($voucher->commodity_id != 0 && $voucher->commodity_id != $commodity->id) {
+            throw new JSONException("该优惠券不属于该商品");
+        }
+        if ($voucher->race && $voucher->commodity_id != 0 && $race != $voucher->race) {
+            throw new JSONException("该优惠券不能抵扣当前商品");
+        }
+        if ($voucher->sku && is_array($voucher->sku) && $voucher->commodity_id != 0) {
+            if (!is_array($sku)) {
+                throw new JSONException("此优惠券不适用当前商品");
+            }
+            foreach ($voucher->sku as $key => $sk) {
+                if (!isset($sku[$key])) {
+                    throw new JSONException("此优惠券不适用此SKU");
+                }
+                if ($sk != $sku[$key]) {
+                    throw new JSONException("此优惠券不适用此SKU{$sku[$key]}");
+                }
+            }
+        }
+        if ($voucher->commodity_id == 0 && $voucher->category_id != 0 && $voucher->category_id != $commodity->category_id) {
+            throw new JSONException("该优惠券不能抵扣当前商品");
+        }
+        if ($voucher->status != 0) {
+            throw new JSONException("该优惠券已失效");
+        }
+        if ($voucher->expire_time != null && strtotime($voucher->expire_time) < time()) {
+            throw new JSONException("该优惠券已过期");
+        }
     }
 
     public function getCost(Commodity|int $commodity, int $num = 1, ?string $race = null, ?array $sku = [], ?int $cardId = null): string
@@ -351,10 +373,10 @@ class Order implements \App\Service\Order
             $shop = Di::inst()->make(\App\Service\Shop::class);
 
             if ($commodity->shared) {
-                $draft = $this->shared->getDraft($commodity->shared, $commodity->shared_code, $cardId);
+                $draft = $this->shared->getDraft($commodity->shared, $commodity->shared_code, $cardId, (string)$race, $sku ?: []);
                 $draftPremium = $draft['draft_premium'];
             } else {
-                $draft = $shop->getDraft($commodity, $cardId);
+                $draft = $shop->getDraft($commodity, $cardId, (string)$race, $sku ?: []);
                 $draftPremium = $draft['cost'];
             }
 
@@ -450,16 +472,19 @@ class Order implements \App\Service\Order
         }
     }
 
-    private function lockLocalDraftCardForOrder(Commodity $commodity, int $cardId): void
+    /**
+     * 预选卡加行锁：存在、属于本商品、还没卖出。返回锁住的卡；不是本地预选商品时返回 null。
+     */
+    private function lockDraftCard(Commodity $commodity, int $cardId): ?Card
     {
         if ($cardId <= 0 || (int)$commodity->draft_status !== 1 || (int)$commodity->shared_id > 0) {
-            return;
+            return null;
         }
 
         $card = Card::query()
             ->whereKey($cardId)
             ->lockForUpdate()
-            ->first(['id', 'commodity_id', 'status']);
+            ->first(['id', 'commodity_id', 'status', 'race', 'sku']);
         if (!$card) {
             throw new JSONException('预选的宝贝不存在');
         }
@@ -468,6 +493,110 @@ class Order implements \App\Service\Order
         }
         if ((int)$card->status !== 0) {
             throw new JSONException('此宝贝已被他人抢走');
+        }
+        return $card;
+    }
+
+    /**
+     * 下单时锁住预选卡，并确认它正是本单所选的种类与规格：订单按所选规格计价，
+     * 换成别的规格的卡就是「便宜规格的价钱买走贵规格的卡」。
+     */
+    private function lockLocalDraftCardForOrder(Commodity $commodity, int $cardId, string $race, ?array $sku): void
+    {
+        $card = $this->lockDraftCard($commodity, $cardId);
+        if ($card && !Sku::cardSelectable((int)$card->id, $race, $sku, Sku::selectionConfig($commodity))) {
+            throw new JSONException(Sku::DRAFT_MISMATCH);
+        }
+    }
+
+    /**
+     * 这个商品「本身是否有价值」——用于判断一笔算出 0 元的订单是合法的免费商品，还是被压到 0 的攻击/误配。
+     *
+     * 只要满足任一条即视为「有价值」，就不允许 0 元直发：
+     *   - 有成本(factory_price>0) 或 是转售/货源商品(shared_id>0)——0 元发货等于平台/上游净亏；
+     *   - 零售价或会员价任一为正；
+     *   - config 里任一价格档(category/wholesale/category_wholesale)为正。
+     * 全都为 0 才是「本就免费」的商品(零售价 0、无档、无成本、非货源)，允许 0 元直发。
+     * sku 是加价项、draft_premium 是溢价项，都只增不减，不参与「基础价值」判定。
+     */
+    private function commodityHasPositiveValue(Commodity $commodity): bool
+    {
+        if ((float)$commodity->factory_price > 0 || (int)$commodity->shared_id > 0) {
+            return true;
+        }
+        if ((float)$commodity->price > 0 || (float)$commodity->user_price > 0) {
+            return true;
+        }
+        $config = Ini::toArray((string)$commodity->config);
+        foreach (['category', 'wholesale', 'category_wholesale'] as $section) {
+            if (empty($config[$section]) || !is_array($config[$section])) {
+                continue;
+            }
+            $positive = false;
+            array_walk_recursive($config[$section], static function ($value) use (&$positive): void {
+                if (is_numeric($value) && (float)$value > 0) {
+                    $positive = true;
+                }
+            });
+            if ($positive) {
+                return true;
+            }
+        }
+        //会员组独立定价(level_price)：只按会员组报价、顶层价格为 0 的商品，前面都判不出价值，会落到
+        //0 元直发分支把真实卡密免费送出。这里把每个会员组的 amount 与其内层 config 一并纳入判定。
+        $levelPrice = (array)json_decode((string)$commodity->level_price, true);
+        foreach ($levelPrice as $entry) {
+            if (!is_array($entry)) {
+                continue;
+            }
+            if ((float)($entry['amount'] ?? 0) > 0) {
+                return true;
+            }
+            $innerConfig = Ini::toArray((string)($entry['config'] ?? ''));
+            foreach (['category', 'wholesale', 'category_wholesale'] as $section) {
+                if (empty($innerConfig[$section]) || !is_array($innerConfig[$section])) {
+                    continue;
+                }
+                $innerPositive = false;
+                array_walk_recursive($innerConfig[$section], static function ($value) use (&$innerPositive): void {
+                    if (is_numeric($value) && (float)$value > 0) {
+                        $innerPositive = true;
+                    }
+                });
+                if ($innerPositive) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 对接商品不许亏本卖：本站实收（顾客实付扣掉分站返利、推广分成）不能低于上游对本站账号的实时报价。
+     *
+     * 本地售价只在详情页被访问时才跟上游同步，种类/批发/SKU 还要另开配置同步，普通加价从不碰等级价，
+     * 汇率也会变——上游一涨价，本地就在不知情的情况下按旧价一直亏着卖（rent 算了却从来没人比）。
+     * 只在拿到实时报价时判断，询价失败照旧放行；用了优惠券的单是站长主动让利（要先打开商品的优惠卷开关），不拦。
+     *
+     * @throws JSONException
+     */
+    private function assertNotBelowUpstreamCost(int $commodityId, mixed $quotedRent, string|int|float $amount, string|int|float $rebate, string|int|float $divideAmount, bool $couponApplied): void
+    {
+        if ($couponApplied || !is_numeric($quotedRent) || (float)$quotedRent <= 0) {
+            return;
+        }
+
+        $net = new Decimal($amount, 2);
+        (float)$rebate > 0 && $net = $net->sub($rebate);
+        (float)$divideAmount > 0 && $net = $net->sub($divideAmount);
+        //报价换算过汇率时可能带 6 位小数，截到分再比，别因为不到 1 分钱的换算误差拦单
+        $cost = (new Decimal(sprintf('%.6F', (float)$quotedRent), 6))->getAmount();
+
+        if (bccomp($net->getAmount(), $cost, 2) < 0) {
+            throw new JSONException(\App\Util\SharedPayload::guardMessage(
+                "对接商品[{$commodityId}]本单实收 {$net->getAmount()} 低于上游进价 {$cost}，已拒绝下单：请开启价格同步或调高加价",
+                "商品价格已变动，请刷新页面后重新下单"
+            ));
         }
     }
 
@@ -491,6 +620,11 @@ class Order implements \App\Service\Order
             $from = $user->pid;
         }
 
+        $promotion = \App\Util\Promotion::enabled();
+        if (!$promotion) {
+            $from = 0;
+        }
+
         if ($commodityId == 0) {
             throw new JSONException("请选择商品");
         }
@@ -499,6 +633,7 @@ class Order implements \App\Service\Order
             throw new JSONException("至少购买1个");
         }
 
+        \App\Util\Schema::ensureCommodityControl();
         $commodity = Commodity::with(['shared'])->find($commodityId);
 
         if (!$commodity) {
@@ -507,6 +642,11 @@ class Order implements \App\Service\Order
 
         if ($commodity->status != 1) {
             throw new JSONException("当前商品已停售");
+        }
+
+        $substation = Business::get();
+        if ($substation && !$substation->sells($commodity)) {
+            throw new JSONException("商品不存在");
         }
 
         if (Config::get("force_login") == 1 || $commodity->only_user == 1 || $commodity->purchase_count > 0) {
@@ -617,14 +757,11 @@ class Order implements \App\Service\Order
             throw new JSONException("库存不足");
         }
 
-        if ($commodity->purchase_count > 0 && $owner > 0) {
-            $orderCount = \App\Model\Order::query()->where("owner", $owner)->where("commodity_id", $commodity->id)->count();
-            if ($orderCount >= $commodity->purchase_count) {
-                throw new JSONException("该商品每人只能购买{$commodity->purchase_count}件");
-            }
-        }
+        PurchaseLimit::assert($commodity, (int)$owner, (int)$num);
 
         $amount = $this->valuation($commodity, $num, $race, $sku, $cardId, $coupon, $userGroup);
+        //对接商品的上游实时报价（询价失败为 0）；下面的 getCost 兜底只是本地估算，不能拿来判断亏本
+        $quotedRent = $rent;
         $rent == 0 && $rent = $this->getCost($commodity, $num, $race, $sku, $cardId);
         $rebate = 0;
         $divideAmount = 0;
@@ -670,6 +807,10 @@ class Order implements \App\Service\Order
             $from = 0;
         }
 
+        if ($commodity->shared) {
+            $this->assertNotBelowUpstreamCost((int)$commodity->id, $quotedRent, $amount, $rebate, $divideAmount, !empty($coupon) && $num == 1);
+        }
+
         $pay = Pay::query()->find($payId);
 
         if (!$pay) {
@@ -688,14 +829,14 @@ class Order implements \App\Service\Order
         }
 
         DB::connection()->getPdo()->exec("set session transaction isolation level serializable");
-        $result = Db::transaction(function () use ($commodity, $rent, $rebate, $divideAmount, $business, $sku, $requestNo, $user, $userGroup, $num, $contact, $device, $amount, $owner, $pay, $cardId, $password, $coupon, $from, $widget, $race, $callbackDomain, $clientDomain) {
+        $result = Db::transaction(function () use ($commodity, $rent, $rebate, $divideAmount, $business, $sku, $requestNo, $user, $userGroup, $num, $contact, $device, $amount, $owner, $pay, $cardId, $password, $coupon, $from, $promotion, $widget, $race, $callbackDomain, $clientDomain) {
             $lockedCommodity = $this->lockCommodityForOrder($commodity);
 
             if ((int)$lockedCommodity->status !== 1) {
                 throw new JSONException('当前商品已停售');
             }
             $this->assertTradeCommoditySnapshot($commodity, $lockedCommodity);
-            $this->lockLocalDraftCardForOrder($lockedCommodity, $cardId);
+            $this->lockLocalDraftCardForOrder($lockedCommodity, $cardId, $race, $sku);
 
             if (((int)$lockedCommodity->only_user === 1 || (int)$lockedCommodity->purchase_count > 0) && $owner === 0) {
                 throw new JSONException('请先登录后再购买哦');
@@ -714,15 +855,8 @@ class Order implements \App\Service\Order
                     throw new JSONException('抢购已结束');
                 }
             }
-            if ((int)$lockedCommodity->purchase_count > 0 && $owner > 0) {
-                $orderCount = \App\Model\Order::query()
-                    ->where('owner', $owner)
-                    ->where('commodity_id', $lockedCommodity->id)
-                    ->count();
-                if ($orderCount >= (int)$lockedCommodity->purchase_count) {
-                    throw new JSONException("该商品每人只能购买{$lockedCommodity->purchase_count}件");
-                }
-            }
+            //限购按件数：商品行已锁，同一商品的下单在这里排队，合计不会被并发绕过
+            PurchaseLimit::assert($lockedCommodity, (int)$owner, (int)$num);
 
             if ($user) {
                 $contact = Str::generateRandStr(16);
@@ -763,13 +897,16 @@ class Order implements \App\Service\Order
             if ($divideAmount > 0) $order->divide_amount = $divideAmount;
 
             if (!empty($coupon)) {
+                //纵深防御：消耗前按与报价同一套口径再校验（归属 / 商品 / SKU / 品类 / 状态 / 过期）+ 限单件，
+                //绝不消耗一张没通过校验的券——堵住 num>=2 / level_disable 等旁路烧掉他人商户券的跨租户绕过。
+                if ($num != 1) {
+                    throw new JSONException("优惠券仅限购买单件商品时使用");
+                }
                 $voucher = Coupon::query()->where("code", $coupon)->lockForUpdate()->first();
                 if (!$voucher) {
-                    throw new JSONException("优惠券不存");
+                    throw new JSONException("该优惠券不存在");
                 }
-                if ($voucher->status != 0) {
-                    throw new JSONException("该优惠券已失效");
-                }
+                $this->assertCouponApplicable($voucher, $commodity, $race, $sku);
                 $voucher->service_time = $date;
                 $voucher->use_life = $voucher->use_life + 1;
                 $voucher->life = $voucher->life - 1;
@@ -787,6 +924,18 @@ class Order implements \App\Service\Order
 
             $url = "";
             if ((float)$order->amount <= 0) {
+                //0 元直发**只对「本就免费」的商品成立**：零售价/会员价/各价格档全为 0、无成本、非货源。
+                //否则一个被留空或填 0 的价格档、分站四舍五入抹零、100% 会员折扣，或对接方选中 0 价档，
+                //都会让 valuation 算出 0 → 命中这里把**有价值的真实卡密**免费发出去（货源商品平台还要向上游代付）。
+                //有价值的商品却算出 ≤0、且不是满额优惠券抵扣的，一律判为配置异常/被利用，拒单。
+                if ((float)$order->amount < 0) {
+                    throw new JSONException("商品价格配置异常，暂时无法下单，请联系商家");
+                }
+                if ($this->commodityHasPositiveValue($lockedCommodity)
+                    && (empty($order->coupon_id)
+                        || bccomp($this->valuation($lockedCommodity, $num, $race, $sku, $cardId, null, $userGroup), "0", 2) <= 0)) {
+                    throw new JSONException("商品价格配置异常，暂时无法下单，请联系商家");
+                }
                 $order->amount = "0.00";
                 $order->save();
                 $secret = $this->orderSuccess($order);
@@ -808,7 +957,7 @@ class Order implements \App\Service\Order
                         throw new JSONException("You have been banned");
                     }
                     $parent = $session->parent;
-                    if ($parent && $order->user_id != $from) {
+                    if ($promotion && $parent && $order->user_id != $from) {
                         $order->from = $parent->id;
                     }
 
@@ -871,6 +1020,21 @@ class Order implements \App\Service\Order
             return ['url' => $url, 'amount' => $order->amount, 'tradeNo' => $order->trade_no, 'secret' => $secret, 'leave_message' => \App\Model\Order::resolveLeaveMessage($order->leave_message, null)];
         });
         $result["stock"] = $shopService->getItemStock($commodity, $race, $sku);
+        return $this->presentDelivery($result);
+    }
+
+    /**
+     * Buyer-facing form of a trade result: file links on the origin the buyer is using now,
+     * plus their name/size as delivery_files (only when the content carries this site's files).
+     */
+    private function presentDelivery(array $result): array
+    {
+        if (is_string($result['secret'] ?? null) && $result['secret'] !== '') {
+            [$result['secret'], $deliveryFiles] = Link::decorate($result['secret']);
+            if ($deliveryFiles !== []) {
+                $result['delivery_files'] = $deliveryFiles;
+            }
+        }
         return $result;
     }
 
@@ -962,6 +1126,24 @@ class Order implements \App\Service\Order
         $commodity = $order->commodity;
         $order->pay_time = Date::current();
         $order->status = 1;
+
+        //发货前的最后一道闸门。这是**唯一**能在卡密交出去之前把货扣下的位置，
+        //一处插入覆盖全部支付路径（0 元单、余额支付、各网关回调）。
+        //钱已经收到了，此刻不该再谈「拒绝」，只该决定卡发不发 ——
+        //所以订阅方只用 REVIEW：delivery_status 留 0、secret 换成提示文案，
+        //也就是手动发货商品在付款到发货之间的既有形态。
+        $risk = new \App\Entity\RiskContext('delivery');
+        hook(Hook::USER_API_ORDER_DELIVERY_BEGIN, $risk, $order, $commodity);
+        if ($risk->held()) {
+            $order->delivery_status = 0;
+            $order->secret = $risk->message("订单正在人工审核中，通过后会立即发货，请耐心等待。");
+            $order->save();
+            hook(Hook::USER_API_ORDER_PAY_AFTER, $commodity, $order, $order->pay);
+            //跳过：拉卡密、扣库存、分成与返利账单、发货邮件 ——
+            //这些副作用一个都没执行，所以审核通过后重跑一次恰好是对的
+            return (string)$order->secret;
+        }
+
         $shared = $commodity->shared;
 
         if ($shared) {
@@ -972,7 +1154,14 @@ class Order implements \App\Service\Order
                 $order->secret = $this->pullCardForLocal($order, $commodity);
                 $order->delivery_status = 1;
             } else {
-                $order->secret = ($commodity->delivery_message != null && $commodity->delivery_message != "") ? $commodity->delivery_message : '正在发货中，请耐心等待，如有疑问，请联系客服。';
+                //付款即发货：发货信息是固定内容（通用卡密、下载链接等），直接作为卡密发出，订单即为已发货；
+                //关闭时维持原状——发货信息只是等待提示，订单留在待发货，等站长手动发货
+                if ((int)$commodity->delivery_auto === 1 && trim((string)$commodity->delivery_message) !== '') {
+                    $order->secret = (string)$commodity->delivery_message;
+                    $order->delivery_status = 1;
+                } else {
+                    $order->secret = ($commodity->delivery_message != null && $commodity->delivery_message != "") ? $commodity->delivery_message : '正在发货中，请耐心等待，如有疑问，请联系客服。';
+                }
 
                 if ($commodity->stock >= $order->card_num) {
                     Commodity::query()->where("id", $commodity->id)->decrement('stock', $order->card_num);
@@ -1010,61 +1199,121 @@ class Order implements \App\Service\Order
 
     private function pullCardForLocal(\App\Model\Order $order, Commodity $commodity): string
     {
-        $secret = "很抱歉，有人在你付款之前抢走了商品，请联系客服。";
+        $soldOut = "很抱歉，有人在你付款之前抢走了商品，请联系客服。";
 
+        //预选卡：下单时 lockLocalDraftCardForOrder 只校验了「未售、规格相符」但并未落定，付款到发货之间可能被另一笔
+        //同样预选它的订单抢先发出。这里加行锁复查 status 后再落定交付，杜绝同一张卡密发给两个买家。
         $draft = $order->card;
-
         if ($draft) {
-            if ($draft->status == 0) {
-                $secret = $draft->secret;
-                $draft->purchase_time = $order->pay_time;
-                $draft->order_id = $order->id;
-                $draft->status = 1;
-                $draft->save();
-            }
-            return $secret;
-        }
-
-        $direction = match ($commodity->delivery_auto_mode) {
-            0 => "id asc",
-            1 => "rand()",
-            2 => "id desc"
-        };
-        $cards = Card::query()->where("commodity_id", $order->commodity_id)->orderByRaw($direction)->where("status", 0);
-
-        if ($order->race) {
-            $cards = $cards->where("race", $order->race);
-        } else {
-            $cards = $cards->where(function ($query) {
-                $query->whereNull("race")->orWhere("race", "");
+            return DB::transaction(function () use ($order, $commodity, $draft, $soldOut): string {
+                $locked = Card::query()->whereKey($draft->id)->lockForUpdate()->first();
+                if (!$locked || (int)$locked->status !== 0) {
+                    return $soldOut;
+                }
+                //交付前按订单所选规格再比一次（含修补前已下、未付款的单）：不是这个规格的卡一律不发，交给站长处理
+                if ((int)$locked->commodity_id !== (int)$order->commodity_id
+                    || !Sku::cardSelectable((int)$locked->id, (string)$order->race, $order->sku ?: null, Sku::selectionConfig($commodity))) {
+                    \Kernel\Util\Log::inst()->error("订单[{$order->trade_no}]预选卡密[{$locked->id}]与订单所选种类/规格不一致，未发货，请人工核对后处理");
+                    return "预选卡密与订单所选规格不一致，暂时无法发货，请联系客服。";
+                }
+                $files = $this->lockCardFiles([(int)$locked->id]);
+                $locked->purchase_time = $order->pay_time;
+                $locked->order_id = $order->id;
+                $locked->status = 1;
+                $locked->save();
+                return implode(PHP_EOL, $this->deliverCards([$locked], $files, $order));
             });
         }
 
-        if (!empty($order->sku)) {
-            foreach ($order->sku as $k => $v) {
-                $cards = $cards->where("sku->{$k}", $v);
+        $direction = match ($commodity->delivery_auto_mode) {
+            1 => "rand()",
+            2 => "id desc",
+            default => "id asc",
+        };
+
+        //自动拉卡：原实现「读候选」与「标记已售」之间无锁、且 UPDATE 不带 status=0 守卫，两笔并发能读到
+        //同一批 status=0 的卡各自发货（同卡两卖）。照抄预选路径的做法——事务内 lockForUpdate 锁住候选行、
+        //复核数量足够后再原子落定；不足则一张都不抢（避免锁到的卡被标售却没交付=泄漏库存，仍走「付了没货」
+        //由站长手动退款的既有取舍）。高并发下单路径本就在 serializable 事务内，这里的锁与之叠加不改变语义。
+        $selection = Sku::selectionConfig($commodity);
+        return DB::transaction(function () use ($order, $direction, $soldOut, $selection): string {
+            $cards = Card::query()
+                ->where("commodity_id", $order->commodity_id)
+                ->where("status", 0)
+                ->orderByRaw($direction);
+
+            //与预选卡复核同一口径（Sku::cardSelectable 也走这里）；商品没有种类时不按种类筛
+            $cards = Sku::whereCardSelection($cards, (string)$order->race, $order->sku ?: null, $selection);
+
+            $cards = $cards->lockForUpdate()->limit($order->card_num)->get();
+
+            if (count($cards) != $order->card_num) {
+                return $soldOut;
             }
-        }
 
-        $cards = $cards->limit($order->card_num)->get();
-
-        if (count($cards) == $order->card_num) {
             $ids = [];
-            $cardc = '';
             foreach ($cards as $card) {
                 $ids[] = $card->id;
-                $cardc .= $card->secret . PHP_EOL;
             }
-            try {
-                $rows = Card::query()->whereIn("id", $ids)->update(['purchase_time' => $order->pay_time, 'order_id' => $order->id, 'status' => 1]);
-                if ($rows != 0) {
-                    $secret = trim($cardc, PHP_EOL);
-                }
-            } catch (\Exception $e) {
+            $files = $this->lockCardFiles($ids);
+
+            //候选行已被本事务 lockForUpdate 锁住并复核为 status=0，落定必然成功、且不会与并发订单抢到同一张。
+            Card::query()->whereIn("id", $ids)->update([
+                'purchase_time' => $order->pay_time,
+                'order_id' => $order->id,
+                'status' => 1,
+            ]);
+
+            return trim(implode(PHP_EOL, $this->deliverCards($cards, $files, $order)), PHP_EOL);
+        });
+    }
+
+    /**
+     * Archives behind the selected cards, locked together with them; empty on sites without file cards.
+     *
+     * @param int[] $cardIds
+     * @return array<int, CardFile> keyed by card id
+     */
+    private function lockCardFiles(array $cardIds): array
+    {
+        if ($cardIds === [] || !\App\Util\Schema::tableExists('card_file')) {
+            return [];
+        }
+        $files = [];
+        foreach (CardFile::query()->whereIn('card_id', $cardIds)->lockForUpdate()->get() as $file) {
+            $files[(int)$file->card_id] = $file;
+        }
+        return $files;
+    }
+
+    /**
+     * One delivered entry per selected card, in selection order: a file card becomes its download
+     * line and is bound to the order (same transaction), any other card delivers its secret.
+     *
+     * @param iterable<Card> $cards
+     * @param array<int, CardFile> $files keyed by card id
+     * @return string[]
+     */
+    private function deliverCards(iterable $cards, array $files, \App\Model\Order $order): array
+    {
+        $base = null;
+        $entries = [];
+        foreach ($cards as $card) {
+            $file = $files[(int)$card->id] ?? null;
+            if ($file === null) {
+                $entries[] = (string)$card->secret;
+                continue;
             }
+            $base ??= Link::deliveryBase();
+            $entries[] = Link::line($file, $base);
         }
 
-        return $secret;
+        if ($files !== []) {
+            CardFile::query()
+                ->whereIn('id', array_map(static fn(CardFile $file): int => (int)$file->id, array_values($files)))
+                ->update(['order_id' => (int)$order->id]);
+        }
+        return $entries;
     }
 
     public function callback(string $tradeNo, array $map): string
@@ -1217,47 +1466,8 @@ class Order implements \App\Service\Order
                 throw new JSONException("该优惠券不存在");
             }
 
-            if ($voucher->owner != $commodity->owner) {
-                throw new JSONException("该优惠券不存在");
-            }
-
-            if ($voucher->commodity_id != 0 && $voucher->commodity_id != $commodity->id) {
-                throw new JSONException("该优惠券不属于该商品");
-            }
-
-            if ($voucher->race && $voucher->commodity_id != 0) {
-                if ($race != $voucher->race) {
-                    throw new JSONException("该优惠券不能抵扣当前商品");
-                }
-            }
-
-            if ($voucher->sku && is_array($voucher->sku) && $voucher->commodity_id != 0) {
-                if (!is_array($sku)) {
-                    throw new JSONException("此优惠券不适用当前商品");
-                }
-
-                foreach ($voucher->sku as $key => $sk) {
-                    if (!isset($sku[$key])) {
-                        throw new JSONException("此优惠券不适用此SKU");
-                    }
-
-                    if ($sk != $sku[$key]) {
-                        throw new JSONException("此优惠券不适用此SKU{$sku[$key]}");
-                    }
-                }
-            }
-
-            if ($voucher->commodity_id == 0 && $voucher->category_id != 0 && $voucher->category_id != $commodity->category_id) {
-                throw new JSONException("该优惠券不能抵扣当前商品");
-            }
-
-            if ($voucher->status != 0) {
-                throw new JSONException("该优惠券已失效");
-            }
-
-            if ($voucher->expire_time != null && strtotime($voucher->expire_time) < time()) {
-                throw new JSONException("该优惠券已过期");
-            }
+            //与报价/消耗共用同一套适用性校验（归属 / 商品 / SKU / 品类 / 状态 / 过期）
+            $this->assertCouponApplicable($voucher, $commodity, $race, $sku);
 
             if ($voucher->mode == 0 && $voucher->money >= $amount) {
                 throw new JSONException("该优惠券面额大于订单金额");
@@ -1280,7 +1490,13 @@ class Order implements \App\Service\Order
     {
         return DB::transaction(function () use ($race, $widget, $contact, $password, $num, $cardId, $commodity, $userId) {
             $lockedCommodity = $this->lockCommodityForOrder($commodity);
-            $this->lockLocalDraftCardForOrder($lockedCommodity, (int)$cardId);
+            //赠品送的就是这张卡：订单的种类与规格以卡为准，发货前的规格复核才对得上
+            $giftCard = $this->lockDraftCard($lockedCommodity, (int)$cardId);
+            $giftSku = null;
+            if ($giftCard) {
+                $race = (string)$giftCard->race;
+                $giftSku = Sku::toArray($giftCard->sku) ?: null;
+            }
 
             $date = Date::current();
             $order = new  \App\Model\Order();
@@ -1303,6 +1519,7 @@ class Order implements \App\Service\Order
             $order->leave_message = $lockedCommodity->leave_message;
             $order->rent = 0;
             $order->race = $race;
+            if ($giftSku) $order->sku = $giftSku;
             $order->user_id = $lockedCommodity->owner;
             $order->setRelation('commodity', $lockedCommodity);
             $order->save();

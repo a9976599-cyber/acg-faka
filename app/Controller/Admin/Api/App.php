@@ -4,6 +4,7 @@ declare(strict_types=1);
 namespace App\Controller\Admin\Api;
 
 use App\Interceptor\ManageSession;
+use App\Interceptor\Owner;
 use App\Interceptor\Waf;
 use App\Model\ManageLog;
 use App\Util\Opcache;
@@ -14,7 +15,7 @@ use Kernel\Annotation\Inject;
 use Kernel\Annotation\Interceptor;
 use Kernel\Exception\JSONException;
 
-#[Interceptor([Waf::class, ManageSession::class], Interceptor::TYPE_API)]
+#[Interceptor([Waf::class, ManageSession::class, Owner::class], Interceptor::TYPE_API)]
 class App extends Manage
 {
     #[Inject]
@@ -181,8 +182,9 @@ class App extends Manage
             $plugins['rows'][$index]['icon'] = \App\Service\App::APP_URL . "/{$plugins['rows'][$index]['icon']}";
         }
 
-        //应用商店条目来自官方远端，属动态文案：只翻展示用的名称与简介，plugin_key 不动
-        $plugins['rows'] = \Kernel\Util\Lang::transList($plugins['rows'], ['plugin_name', 'description']);
+        //应用商店条目来自官方远端：只翻展示用的名称与简介，plugin_key 不动。
+        //记成 meta 而不是 dyn——它不是站长录入的内容，不该被「清理废弃词条」当成商品残留反复删掉再重翻
+        $plugins['rows'] = \Kernel\Util\Lang::transList($plugins['rows'], ['plugin_name', 'description'], 'meta');
 
         $json = $this->json(data: [
             "list" => $plugins['rows'],
@@ -398,8 +400,8 @@ class App extends Manage
         }
         unset($plugin);
 
-        //开发者中心列表同样是远端动态文案
-        $plugins['rows'] = \Kernel\Util\Lang::transList($plugins['rows'], ['plugin_name', 'description']);
+        //开发者中心列表同样是远端插件元数据
+        $plugins['rows'] = \Kernel\Util\Lang::transList($plugins['rows'], ['plugin_name', 'description'], 'meta');
 
         $json = $this->json(data: [
             "list" => $plugins['rows'],

@@ -16,15 +16,22 @@
     };
     const safeItem = item => {
         if (!item) return '-';
+        const banned = Number(item.ban) === 1;
         if (!isSeattleCommodity) {
             const image = item.cover ? `<img src="${escapeHtml(item.cover)}" class="table-item-icon" alt="">` : '';
-            return `<span class="table-item">${image}<span class="table-item-name">${safeInlineHtml(item.name || i18n('未命名商品'))}</span></span>`;
+            const ban = banned
+                ? `<div style="margin-top:4px;white-space:normal"><span class="a-badge a-badge-danger">${i18n('平台下架')}</span>${item.ban_reason ? ` <small style="color:var(--md-error, #d33)">${escapeHtml(item.ban_reason)}</small>` : ''}</div>`
+                : '';
+            return `<span class="table-item">${image}<span class="table-item-name">${safeInlineHtml(item.name || i18n('未命名商品'))}</span></span>${ban}`;
         }
         const image = item.cover
             ? `<span class="st-commodity-product-cell__media"><img src="${escapeHtml(item.cover)}" alt=""></span>`
             : '<span class="st-commodity-product-cell__media"><span class="material-icons-outlined" aria-hidden="true">inventory_2</span></span>';
         const category = item.category && item.category.name ? item.category.name : '未分类';
-        return `<span class="st-commodity-product-cell">${image}<span class="st-commodity-product-cell__copy"><strong>${safeInlineHtml(item.name || i18n('未命名商品'))}</strong><small>${safeInlineHtml(category)}</small></span></span>`;
+        const ban = banned
+            ? `<small style="color:var(--md-error, #d33);white-space:normal">${i18n('平台下架')}${item.ban_reason ? `：${escapeHtml(item.ban_reason)}` : ''}</small>`
+            : '';
+        return `<span class="st-commodity-product-cell">${image}<span class="st-commodity-product-cell__copy"><strong>${safeInlineHtml(item.name || i18n('未命名商品'))}</strong><small>${safeInlineHtml(category)}</small>${ban}</span></span>`;
     };
     const modal = (title, assign = {}) => {
         component.popup({
@@ -93,10 +100,12 @@
                             change: (_, __) => {
                                 if (__ == 1) {
                                     _.show("delivery_message");
+                                    _.show("delivery_auto");
                                     _.hide("delivery_auto_mode");
                                     _.show("stock");
                                 } else {
                                     _.hide("delivery_message");
+                                    _.hide("delivery_auto");
                                     _.show("delivery_auto_mode");
                                     _.hide("stock");
                                 }
@@ -129,6 +138,14 @@
                             placeholder: "手动发货信息，可以是一些固定的卡密或者软件下载链接等..",
                             height: 100,
                             hide: true
+                        },
+                        {
+                            title: "付款即发货",
+                            name: "delivery_auto",
+                            type: "switch",
+                            text: "启用",
+                            hide: true,
+                            tips: "适合固定内容（通用卡密、下载链接等）：买家付款即收到上面的发货信息，订单直接变为已发货。由插件负责发货的商品请勿开启"
                         },
                         {
                             title: "发货留言",
@@ -299,7 +316,7 @@
                         {title: false, name: "config", type: "textarea", placeholder: "配置参数", height: 480},
                         {
                             title: false, name: "config_tips", type: "custom", complete: (_, __) => {
-                                __.html(`<div class="uc-cardtip"><div class="uc-cardtip__warn"><span class="material-icons-outlined">info</span><span>${i18n('配置参数包含商品种类、多')} SKU ${i18n('等高级功能。修改前请先阅读')}<a href="https://faka.wiki/#/zh-cn/goods-config" target="_blank" rel="noopener noreferrer">${i18n('配置文档')}</a>。</span></div></div>`);
+                                __.html(`<div class="uc-cardtip"><div class="uc-cardtip__warn"><span class="material-icons-outlined">info</span><span>${i18n('配置参数包含商品种类、多')} SKU ${i18n('等高级功能。修改前请先阅读')}<a href="https://faka.wiki/zh-cn/guide/goods-config.html" target="_blank" rel="noopener noreferrer">${i18n('配置文档')}</a>。</span></div></div>`);
                             }
                         },
                     ]

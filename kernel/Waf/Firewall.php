@@ -44,6 +44,9 @@ class Firewall
 
         $config->set('Filter.Custom', [IgnoreStyleTagFilter::make()]);
 
+        //圆角/阴影/渐变/flex 等纯视觉 CSS（#952）。必须在下面任何 getDefinition() 之前：配置一旦定稿就改不了
+        ModernCss::configure($config);
+
         $config->getDefinition('URI')->addFilter(URISchemeFilter::make(), $config);
 
         if ($def = $config->maybeGetRawHTMLDefinition()) {
@@ -122,6 +125,7 @@ class Firewall
         }
 
         $this->HTMLPurifier = new \HTMLPurifier($config);
+        ModernCss::install($config);
     }
 
     public function check(callable $callable): void
@@ -132,7 +136,7 @@ class Firewall
         $this->rule["ARG"] = json_decode(file_get_contents($path . "/args.json"), true);
         $this->rule["COOKIE"] = json_decode(file_get_contents($path . "/cookie.json"), true);
 
-        $getPara = urldecode(http_build_query($_GET));
+        $getPara = self::fullyDecode(http_build_query($_GET));
         foreach ($this->rule["ARG"] as $key => $value) {
             if (preg_match("#" . $value[1] . "#i", $getPara)) {
                 $callable($value);
@@ -147,7 +151,7 @@ class Firewall
             }
         }
 
-        $postPara = urldecode(http_build_query($_POST));
+        $postPara = self::fullyDecode(http_build_query($_POST));
         foreach ($this->rule["POST"] as $key => $value) {
             if (preg_match("#" . $value[1] . "#i", $postPara)) {
                 $callable($value);
@@ -155,13 +159,29 @@ class Firewall
             }
         }
 
-        $cookiePara = urldecode(http_build_query($_COOKIE));
+        $cookiePara = self::fullyDecode(http_build_query($_COOKIE));
         foreach ($this->rule["COOKIE"] as $key => $value) {
             if (preg_match("#" . $value[1] . "#i", $cookiePara)) {
                 $callable($value);
                 return;
             }
         }
+    }
+
+    /**
+     * 反复 urldecode 直到稳定（最多 5 轮），再交给黑名单匹配。
+     * 否则双重/多重编码（如 %253Cscript%253E）只被解一次、绕过规则，却在下游被二次解码还原。
+     */
+    private static function fullyDecode(string $input): string
+    {
+        for ($i = 0; $i < 5 && str_contains($input, '%'); $i++) {
+            $decoded = urldecode($input);
+            if ($decoded === $input) {
+                break;
+            }
+            $input = $decoded;
+        }
+        return $input;
     }
 
     private function getCache(string $input): mixed

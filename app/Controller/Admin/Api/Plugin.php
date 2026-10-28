@@ -6,6 +6,7 @@ namespace App\Controller\Admin\Api;
 use App\Consts\Hook;
 use App\Controller\Base\API\Manage;
 use App\Interceptor\ManageSession;
+use App\Interceptor\Owner;
 use App\Model\ManageLog;
 use App\Util\Theme;
 use Kernel\Annotation\Interceptor;
@@ -14,7 +15,7 @@ use Kernel\Context\Interface\Request;
 use Kernel\Exception\JSONException;
 use Kernel\Waf\Filter;
 
-#[Interceptor([ManageSession::class], Interceptor::TYPE_API)]
+#[Interceptor([ManageSession::class, Owner::class], Interceptor::TYPE_API)]
 class Plugin extends Manage
 {
     /**
@@ -26,7 +27,9 @@ class Plugin extends Manage
         $appStore = (array)json_decode((string)file_get_contents(BASE_PATH . "/runtime/plugin/store.cache"), true);
         $path = BASE_PATH . "/app/Plugin/";
 
-        $keywords = urldecode((string)$_POST['keywords']);
+        //搜索不分大小写：插件名里 AI / USDT / Telegram 这类词大小写各异，
+        //站长按小写打进去搜不到很反直觉
+        $keywords = trim(urldecode((string)($_POST['keywords'] ?? '')));
         $status = $_POST['equal-status'];
 
         foreach ($plugins as $key => $plugin) {
@@ -55,8 +58,21 @@ class Plugin extends Manage
             }
 
 
-            if ($keywords) {
-                if (!str_contains($plugin[\App\Consts\Plugin::NAME], $keywords) && !str_contains($plugin[\App\Consts\Plugin::DESCRIPTION], $keywords)) {
+            if ($keywords !== '') {
+                //除了显示名与简介，插件标识也参与匹配：装过的人更习惯直接打 TranslationBot、Usdt 这种英文名
+                $haystack = [
+                    (string)($plugin[\App\Consts\Plugin::NAME] ?? ''),
+                    (string)($plugin[\App\Consts\Plugin::DESCRIPTION] ?? ''),
+                    (string)($plugin[\App\Consts\Plugin::PLUGIN_NAME] ?? ''),
+                ];
+                $hit = false;
+                foreach ($haystack as $text) {
+                    if ($text !== '' && mb_stripos($text, $keywords) !== false) {
+                        $hit = true;
+                        break;
+                    }
+                }
+                if (!$hit) {
                     unset($plugins[$key]);
                 }
             }
@@ -79,7 +95,7 @@ class Plugin extends Manage
         $plugins = \Kernel\Util\Lang::transList($plugins, [
             \App\Consts\Plugin::NAME,
             \App\Consts\Plugin::DESCRIPTION,
-        ]);
+        ], 'meta');
 
         return $this->json(200, 'success', ["list" => $plugins]);
     }

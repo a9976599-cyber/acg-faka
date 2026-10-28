@@ -31,19 +31,9 @@ class Config extends Manage
 
     public function index(): string
     {
-        $modes = [
-            'REMOTE_ADDR',
-            'HTTP_X_REAL_IP',
-            'HTTP_X_FORWARDED_FOR',
-            'HTTP_CLIENT_IP',
-            'HTTP_X_FORWARDED',
-            'HTTP_X_CLUSTER_CLIENT_IP',
-            'HTTP_FORWARDED_FOR',
-            'HTTP_FORWARDED',
-            'HTTP_CF_CONNECTING_IP'
-        ];
+        $modes = Client::HEADERS;
 
-        for ($i = 0; $i <= 8; $i++) {
+        foreach (array_keys($modes) as $i) {
             $ip = Client::getIp($i);
             $modes[$i] = $modes[$i] . " - " . ($ip ?: "此模式不适用");
         }
@@ -107,20 +97,23 @@ class Config extends Manage
 
     public function security(): string
     {
-        $modes = [
-            'REMOTE_ADDR',
-            'HTTP_X_REAL_IP',
-            'HTTP_X_FORWARDED_FOR',
-            'HTTP_CLIENT_IP',
-            'HTTP_X_FORWARDED',
-            'HTTP_X_CLUSTER_CLIENT_IP',
-            'HTTP_FORWARDED_FOR',
-            'HTTP_FORWARDED',
-            'HTTP_CF_CONNECTING_IP'
-        ];
-        for ($i = 0; $i <= 8; $i++) {
+        $modes = Client::HEADERS;
+        foreach (array_keys($modes) as $i) {
             $ip = Client::getIp($i);
             $modes[$i] = $modes[$i] . " - " . ($ip ?: "此模式不适用");
+        }
+
+        $cspAllow = [];
+        foreach (\App\Util\Csp::KINDS as $kind => $spec) {
+            foreach (\App\Util\Csp::allowList($kind) as $src) {
+                $cspAllow[] = [
+                    'source' => $src,
+                    'kind' => $kind,
+                    'label' => $spec['label'],
+                    //只填到域名的条目范围最大，界面上要标出来
+                    'broad' => $kind === 'script' && !str_contains(preg_replace('#^https?://#', '', $src) ?? $src, '/'),
+                ];
+            }
         }
 
         return $this->render("安全设置", "Config/Security.html", [
@@ -134,6 +127,7 @@ class Config extends Manage
             "request_log_summary" => \Kernel\Util\RequestLogger::summary(),
             "csp_summary" => \App\Util\Csp::summary(),
             "csp_violations" => \App\Util\Csp::violations(30),
+            "csp_allow" => $cspAllow,
         ]);
     }
 

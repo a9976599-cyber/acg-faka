@@ -57,6 +57,12 @@ class Category extends User
         $userId = $this->getUser()->id;
         $id = isset($map['id']) ? (int)$map['id'] : 0;
 
+        //商户分类名同 Commodity：入库前走 HTMLPurifier 净化，保留安全样式、剥 XSS 向量。
+        //站长分类走后台 admin 控制器、不经此处，DIY 不受影响。
+        if (isset($map['name']) && is_string($map['name']) && trim($map['name']) !== '') {
+            $map['name'] = \App\Util\RichHtml::sanitize($map['name'], false);
+        }
+
         if ($id > 0 && !\App\Model\Category::query()->where("owner", $userId)->where("id", $id)->exists()) {
             throw new JSONException("分类不存在");
         }
@@ -102,11 +108,22 @@ class Category extends User
             }
         }
 
+        // pid 单独处理：category.pid 有外键指向 category.id，顶级分类必须写 NULL。
+        // 旧实现用 setMap 写 pid=0（"设为顶级"节点的值），而不存在 id=0 的分类 → 外键约束失败 → 整个保存 500
+        // （后台 Admin\Api\Category::save 走的就是 addForceMap null，所以后台没事、只有商户端报错）。
+        $hasParent = array_key_exists('pid', $map);
+        $parentId = $hasParent ? (int)$map['pid'] : 0;
+        unset($map['pid']);
+
         // 只放前台分类编辑弹窗真正提交的列，owner 已强制成当前商户。
         // 同 issue #912：不加白名单等于任意列批量赋值，商户能改到 user_level_config 等非表单字段。
         $save = new Save(\App\Model\Category::class);
         $save->addForceMap("owner", $userId);
-        $save->setMap($map, ['name', 'icon', 'pid', 'sort', 'status']);
+        $save->allowEmpty = ['icon'];
+        $save->setMap($map, ['name', 'icon', 'sort', 'status']);
+        if ($hasParent) {
+            $save->addForceMap('pid', $parentId > 0 ? $parentId : null);
+        }
         $save->enableCreateTime();
         $save = $this->query->save($save);
         if (!$save) {

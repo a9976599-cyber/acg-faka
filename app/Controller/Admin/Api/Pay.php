@@ -8,6 +8,7 @@ use App\Controller\Base\API\Manage;
 use App\Entity\PayEntity;
 use App\Entity\Query\Get;
 use App\Interceptor\ManageSession;
+use App\Interceptor\Owner;
 use App\Model\Config as ConfigModel;
 use App\Model\ManageLog;
 use App\Model\Order;
@@ -27,7 +28,8 @@ use Kernel\Context\Interface\Request;
 use Kernel\Exception\JSONException;
 use Kernel\Waf\Filter;
 
-#[Interceptor([ManageSession::class], Interceptor::TYPE_API)]
+//支付通道=网关凭据/回调配置(含插件真实密钥)，收敛到站长(type==0)本人（F-12）
+#[Interceptor([ManageSession::class, Owner::class], Interceptor::TYPE_API)]
 class Pay extends Manage
 {
 
@@ -576,10 +578,10 @@ class Pay extends Manage
             return ($b['have_update'] ?? false) <=> ($a['have_update'] ?? false);
         });
 
-        //支付插件的名称/简介/功能项来自各插件 Config/Info.php，属动态文案
+        //支付插件的名称/简介/功能项来自各插件 Config/Info.php，属插件元数据（scene=meta，不参与废词条回收）
         $plugins = \Kernel\Util\Lang::transList($plugins, [
             'info.name', 'info.description', 'info.options',
-        ]);
+        ], 'meta');
 
         return $this->json(data: ["list" => $plugins]);
     }

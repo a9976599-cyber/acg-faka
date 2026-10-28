@@ -60,6 +60,43 @@
 
     table = new Table("/admin/api/order/data", "#order-table");
 
+    // Deliveries with file cards: window.acgDelivery (ready.js) renders one download row per file.
+    const DELIVERY_STYLE_ID = 'md-order-delivery-style';
+    const hasDeliveryFiles = secret => Boolean(window.acgDelivery && typeof window.acgDelivery.hasFile === 'function' && window.acgDelivery.hasFile(secret));
+    const ensureDeliveryStyle = () => {
+        if (document.getElementById(DELIVERY_STYLE_ID)) return;
+        const style = document.createElement('style');
+        style.id = DELIVERY_STYLE_ID;
+        style.textContent = `
+            .md-order-delivery{--acg-delivery-accent:var(--md-primary);--acg-delivery-on-accent:var(--md-on-primary);--acg-delivery-accent-soft:rgba(var(--md-primary-rgb),.12);
+                --acg-delivery-border:var(--md-divider);--acg-delivery-surface:var(--md-hover-overlay);--acg-delivery-radius:var(--md-radius-lg);
+                --acg-delivery-success:var(--md-success);color:var(--md-on-surface)}
+            .md-order-delivery__body{max-height:min(56vh,460px);overflow:auto;overscroll-behavior:contain}
+            .md-order-delivery .acg-delivery__text{padding:12px 14px;border:1px solid var(--md-divider);border-radius:var(--md-radius);background:var(--md-bg);
+                font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.7;user-select:text;-webkit-user-select:text}
+            .md-order-delivery .acg-delivery__name{color:var(--md-on-surface)}
+            .md-order-delivery .acg-delivery__sub,.md-order-delivery .acg-delivery__url{color:var(--md-on-surface-med);opacity:1}
+        `;
+        document.head.appendChild(style);
+    };
+    const renderDelivery = (secret, meta) => {
+        const files = window.acgDelivery.files(secret);
+        const root = window.acgDelivery.render(secret, {meta: meta});
+        root.querySelectorAll('.acg-delivery__file').forEach((row, index) => {
+            const link = row.querySelector('.acg-delivery__download');
+            if (!link) return;
+            // Admin PJAX takes over every a[target!=_blank]; a download must stay a plain navigation.
+            link.target = '_blank';
+            const info = meta && files[index] ? meta[files[index].token] : null;
+            if (info && Number(info.id) > 0) {
+                // Admin copy of the file, so previewing does not count as the buyer's download.
+                link.href = `/admin/api/cardFile/download?id=${Number(info.id)}`;
+                link.rel = 'noopener';
+            }
+        });
+        return root;
+    };
+
     const mobileDeliverySubmit = order => {
         let confirming = false;
         let requesting = false;
@@ -225,10 +262,15 @@
         , {
             field: 'card_num', title: '数量/金额', formatter: (_, __) => {
                 const amt = parseFloat(__.amount) || 0;
+                //订单金额已含支付通道手续费，单独列一行提示，避免和商品定价混淆（issue #903）
+                const fee = parseFloat(__.pay_cost) || 0;
                 const amountHtml = amt > 0
                     ? `<span class="md-pair__v" style="color:var(--md-success);font-weight:600">${format.currencySymbol()}${format.amountRemoveTrailingZeros(amt)}</span>`
                     : `<span class="md-pair__v md-pair__v--muted">${format.currencySymbol()}0</span>`;
-                return `<div class="md-pair"><div class="md-pair__row"><span class="md-pair__k">${i18n('数量')}</span><span class="md-pair__v">${__.card_num ?? '-'}</span></div><div class="md-pair__row"><span class="md-pair__k">${i18n('金额')}</span>${amountHtml}</div></div>`;
+                const feeRow = fee > 0
+                    ? `<div class="md-pair__row"><span class="md-pair__k">${i18n('含手续费')}</span><span class="md-pair__v md-pair__v--muted">${format.currencySymbol()}${format.amountRemoveTrailingZeros(fee)}</span></div>`
+                    : '';
+                return `<div class="md-pair"><div class="md-pair__row"><span class="md-pair__k">${i18n('数量')}</span><span class="md-pair__v">${__.card_num ?? '-'}</span></div><div class="md-pair__row"><span class="md-pair__k">${i18n('金额')}</span>${amountHtml}</div>${feeRow}</div>`;
             }
         }
         , {
@@ -244,8 +286,9 @@
             field: 'delivery_status', title: '发货状态', dict: "_order_delivery_status"
         }
         , {
-            field: 'cost', title: '手续费/佣金', formatter: (_, __) => {
-                const fee = parseFloat(__.cost) || 0;
+            field: 'pay_cost', title: '手续费/佣金', formatter: (_, __) => {
+                //手续费取支付通道费 pay_cost（旧 cost 列已废弃、恒为 0）。issue #903
+                const fee = parseFloat(__.pay_cost) || 0;
                 const rebate = parseFloat(__.rebate) || 0;
                 if (fee <= 0 && rebate <= 0) return '-';
                 const fmt = v => format.currencySymbol() + format.amountRemoveTrailingZeros(v);
@@ -279,6 +322,24 @@
                     click: (event, value, map, index) => {
                         const mobile = mobileAdminEnabled();
                         const secret = map.secret ?? '';
+                        if (hasDeliveryFiles(secret)) {
+                            ensureDeliveryStyle();
+                            const meta = map.delivery_files && typeof map.delivery_files === 'object' ? map.delivery_files : null;
+                            openControllerLayer({
+                                ...(mobile ? mobileSheetOptions('md-order-secret-layer') : {area: '560px'}),
+                                type: 1,
+                                title: `${util.icon("fa-duotone fa-regular fa-eye")} ${i18n('查看卡密')}`,
+                                shadeClose: true,
+                                content: `<div class="md-secret md-order-delivery"><div class="md-order-delivery__body"></div><div class="md-secret__bar"><button type="button" class="md-secret__btn" data-act="copy">${util.icon("fa-duotone fa-regular fa-copy")} ${i18n('复制全部')}</button></div></div>`,
+                                success: (layero) => {
+                                    layero.find('.md-order-delivery__body').append(renderDelivery(secret, meta));
+                                    layero.find('[data-act="copy"]').on('click', () => {
+                                        util.copyTextToClipboard(secret, () => message.success('卡密已复制'));
+                                    });
+                                }
+                            });
+                            return;
+                        }
                         const escaped = String(secret).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
                         openControllerLayer({
                             ...(mobile ? mobileSheetOptions('md-order-secret-layer') : {area: '480px'}),
@@ -359,6 +420,7 @@
         {field: 'password', title: '查询密码'},
         {field: 'create_time', title: '下单时间'},
         {field: 'pay_time', title: '支付时间'},
+        {field: 'pay_cost', title: '支付手续费', formatter: v => (parseFloat(v) || 0) > 0 ? format.currencySymbol() + format.amountRemoveTrailingZeros(v) : '-'},
         {field: 'create_ip', title: '客户IP'},
         {field: 'create_device', title: '设备', dict: "_common_device"},
         {field: 'card.secret', title: '预选卡密'},

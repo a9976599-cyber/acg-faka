@@ -84,6 +84,11 @@ class Card extends User
             throw new JSONException('(`･ω･´)请选择商品');
         }
 
+        // File cards (type 2) are admin-only; merchants import text cards.
+        if ((int)$cardType === 2) {
+            throw new JSONException('(`･ω･´)文件卡密仅支持在管理后台导入');
+        }
+
         if (!\App\Model\Commodity::query()->where("owner", $this->getUser()->id)->where("id", $commodityId)->exists()) {
             throw new JSONException('(`･ω･´)商品不存在');
         }
@@ -214,12 +219,19 @@ class Card extends User
             throw new JSONException("卡密不存在");
         }
 
-        if (!\App\Model\Card::query()->where("id", $map['id'])->where("owner", $this->getUser()->id)->exists()) {
+        $card = \App\Model\Card::query()->where("id", $map['id'])->where("owner", $this->getUser()->id)->first();
+        if (!$card) {
             throw new JSONException("卡密不存在");
         }
 
+        //已售卡密(status=1)不得改动交付内容/状态：改 secret=交付后篡改，翻回 status=0=同卡二次交付（F-35）。
+        //与兄弟方法 lock/unlock/sell 的 status!=1 守卫对齐；已售卡最多只允许改内部备注 note。
+        $whitelist = (int)$card->status === 1
+            ? ["note"]
+            : ["draft", "secret", "note", "draft_premium", "status"];
+
         $save = new Save(\App\Model\Card::class);
-        $save->setMap($map, ["draft", "secret", "note", "draft_premium", "status"]);
+        $save->setMap($map, $whitelist);
         $save = $this->query->save($save);
         if (!$save) {
             throw new JSONException("保存失败");
@@ -292,24 +304,24 @@ class Card extends User
     public function export(): string
     {
         $map = $_GET;
-        $exportStatus = $map['export_status'];
-        $exportNum = (int)$map['export_num'];
-        $note = $map['note'] ?: null;
+        $exportStatus = $map['export_status'] ?? null;
+        $exportNum = (int)($map['export_num'] ?? 0);
+        $note = ($map['note'] ?? '') ?: null;
 
         unset($map['export_status']);
         unset($map['export_num']);
+        unset($map['equal-owner']);
 
-
-        $map['equal-owner'] = $this->getUser()->id;
+        $userId = (int)$this->getUser()->id;
         $get = new Get(\App\Model\Card::class);
         $get->setWhere($map);
 
         if ($exportNum > 0) {
             $get->setPaginate(1, $exportNum);
-            $data = $this->query->get($get);
-        } else {
-            $data = $this->query->get($get);
         }
+        $data = $this->query->get($get, function (Builder $builder) use ($userId) {
+            return $builder->where("owner", $userId);
+        });
 
         $card = '';
         $ids = [];
@@ -318,30 +330,35 @@ class Card extends User
             $ids[] = $d['id'];
         }
 
-        if ($note) {
-            \App\Model\Card::query()->whereIn('id', $ids)->update(['note' => $note]);
+        //$ids 已被上面的 owner 闭包限定为当前商户自己的卡密；写分支再各自带上 owner 兜底，
+        //让导出与后续写操作共享同一受控范围，避免任何一处漏掉归属约束就被越权改动。
+        if ($note !== null && $ids !== []) {
+            \App\Model\Card::query()->where("owner", $userId)->whereIn('id', $ids)->update(['note' => $note]);
         }
 
-        if ($exportStatus == 1) {
-            //锁定卡密
-            try {
-                \App\Model\Card::query()->whereIn('id', $ids)->whereRaw("status!=1")->update(['status' => 2]);
-            } catch (\Exception $e) {
+        if ($ids !== []) {
+            if ($exportStatus == 1) {
+                //锁定卡密
+                try {
+                    \App\Model\Card::query()->where("owner", $userId)->whereIn('id', $ids)->whereRaw("status!=1")->update(['status' => 2]);
+                } catch (\Exception $e) {
+                }
+            } elseif ($exportStatus == 2) {
+                //删除卡密
+                try {
+                    $deleteBatchEntity = new Delete(\App\Model\Card::class, $ids);
+                    $deleteBatchEntity->setWhere("owner", "=", $userId);
+                    $this->query->delete($deleteBatchEntity);
+                } catch (\Exception $e) {
+                }
+            } elseif ($exportStatus == 3) {
+                \App\Model\Card::query()->where("owner", $userId)->whereIn('id', $ids)->whereRaw("status!=1")->update(['status' => 1, 'purchase_time' => Date::current()]);
             }
-        } elseif ($exportStatus == 2) {
-            //删除卡密
-            try {
-                $deleteBatchEntity = new Delete(\App\Model\Card::class, $ids);
-                $this->query->delete($deleteBatchEntity);
-            } catch (\Exception $e) {
-            }
-        } elseif ($exportStatus == 3) {
-            \App\Model\Card::query()->whereIn('id', $ids)->whereRaw("status!=1")->update(['status' => 1, 'purchase_time' => Date::current()]);
         }
 
         header('Content-Type:application/octet-stream');
         header('Content-Transfer-Encoding:binary');
-        header('Content-Disposition:attachment; filename=卡密导出(' . count($data) . ')-' . Date::current() . '.txt');
+        header('Content-Disposition:attachment; filename=卡密导出(' . count($data['list']) . ')-' . Date::current() . '.txt');
         return $card;
     }
 }

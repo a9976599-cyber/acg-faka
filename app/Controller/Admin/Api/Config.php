@@ -7,6 +7,7 @@ use App\Consts\Manage as ManageConst;
 use App\Controller\Base\API\Manage;
 use App\Entity\Query\Get;
 use App\Interceptor\ManageSession;
+use App\Interceptor\Owner;
 use App\Model\Business;
 use App\Model\Category;
 use App\Model\Config as CFG;
@@ -15,6 +16,7 @@ use App\Service\Email;
 use App\Service\Query;
 use App\Service\Sms;
 use App\Util\CallbackIpWhitelist;
+use App\Util\CardFile\Policy as CardFilePolicy;
 use App\Util\Client;
 use App\Util\LinkDomainGuard;
 use App\Util\Date;
@@ -56,7 +58,7 @@ class Config extends Manage
         'notice',
         'trade_verification',
         'session_expire',
-
+        'card_file_max_size',
     ];
 
     private const SETTING_BOOLEAN_FIELDS = [
@@ -79,6 +81,7 @@ class Config extends Manage
         'link_domain_filter',
         'link_domain_whitelist',
         'csp_mode',
+        'admin_lock_timeout',
     ];
 
     private const SMS_REQUEST_FIELDS = [
@@ -114,6 +117,7 @@ class Config extends Manage
         'cname',
         'substation_display',
         'force_login',
+        'promote_state',
         'recharge_min',
         'recharge_max',
         'recharge_welfare',
@@ -139,6 +143,7 @@ class Config extends Manage
         'callback_ip_whitelist',
         'substation_display',
         'force_login',
+        'promote_state',
         'recharge_welfare',
         'cash_type_alipay',
         'cash_type_wechat',
@@ -278,18 +283,34 @@ class Config extends Manage
             throw new JSONException('LOGO 文件大小不能超过 10MB');
         }
 
+        $publicFavicon = BASE_PATH . '/favicon.ico';
+        // Docker 部署的公开文件是符号链接，实际内容必须写进持久化卷；传统部署仍然
+        // 直接覆盖网站根目录的 favicon.ico，保持原有行为。
+        $target = is_link($publicFavicon)
+            ? BASE_PATH . '/assets/cache/favicon.ico'
+            : $publicFavicon;
         try {
-            $temporary = BASE_PATH . '/favicon.ico.setting-' . bin2hex(random_bytes(6));
+            $temporary = $target . '.setting-' . bin2hex(random_bytes(6));
         } catch (\Throwable $e) {
             throw new JSONException('无法创建安全的 LOGO 临时文件');
         }
         if (!copy($source, $temporary)) {
             throw new JSONException('LOGO 保存失败，请检查目录权限');
         }
-        if (!rename($temporary, BASE_PATH . '/favicon.ico')) {
+
+        // /favicon.ico 在 Docker 中是指向 assets/cache/favicon.ico 的符号链接。
+        // 不能 rename 到链接路径：rename 会替换链接本身，图片只留在容器可写层，
+        // 重启时链接被恢复后就会重新显示持久化卷里的旧图。
+        if (!@rename($temporary, $target)) {
+            // Windows 不一定允许 rename 覆盖已有文件，保留非 Docker 部署的兼容路径。
+            if (!@copy($temporary, $target)) {
+                @unlink($temporary);
+                throw new JSONException('LOGO 保存失败，请检查目录权限');
+            }
             @unlink($temporary);
-            throw new JSONException('LOGO 保存失败，请检查目录权限');
         }
+        @chmod($target, 0664);
+        clearstatcache(true, $target);
 
     }
 
@@ -626,6 +647,8 @@ class Config extends Manage
         }
     }
 
+    //网站设置(含安全相关开关/公告/主题)，收敛到站长(type==0)本人（F-12）
+    #[Interceptor(Owner::class, Interceptor::TYPE_API)]
     public function setting(Request $request): array
     {
         if (strtoupper($request->method()) !== 'POST') {
@@ -648,6 +671,14 @@ class Config extends Manage
         if ($sessionExpire > 0 && $sessionExpire < 120) {
             throw new JSONException('会话保持时间必须为 0，或至少 120 秒');
         }
+        $cardFileMaxSize = $this->settingInteger(
+            $post,
+            'card_file_max_size',
+            CardFilePolicy::MIN_MB,
+            CardFilePolicy::MAX_MB,
+            '压缩包大小上限',
+            CardFilePolicy::DEFAULT_MB
+        );
 
         $settings = [
             'closed_message' => $this->settingString($post, 'closed_message', 5000),
@@ -666,18 +697,15 @@ class Config extends Manage
             'forget_type' => $forgetType,
             'notice' => $this->settingString($post, 'notice', 60000),
             'session_expire' => $sessionExpire,
+            'card_file_max_size' => $cardFileMaxSize,
         ];
         foreach (self::SETTING_BOOLEAN_FIELDS as $key) {
             $settings[$key] = $this->settingBoolean($post, $key);
         }
 
-        $rawNotice = $request->unsafePost('notice');
-        if (is_string($rawNotice) && !str_contains($rawNotice, "\0")) {
-            if (mb_strlen($rawNotice) > 60000 || strlen($rawNotice) > 60000) {
-                throw new JSONException('网站设置内容超出允许长度');
-            }
-            $settings['notice'] = $rawNotice;
-        }
+        //公告是富文本，但走 settingString($post) 的 post() 净化管线（已在上面赋值给 $settings['notice']）。
+        //不再用 unsafePost 原文覆盖：config.notice ∈ RAW_PATHS，首页/site.info 原样渲染，任意管理员档位
+        //写入的可执行 HTML 会变成首页级存储型 XSS（F-27/F-51）。
 
         $this->installFavicon($logo);
         try {
@@ -691,11 +719,15 @@ class Config extends Manage
         return $this->json(200, '保存成功');
     }
 
+    //安全设置：关请求日志/轮换日志密钥/改后台安全入口/改IP获取模式——最敏感，收敛到站长(type==0)（F-12）
+    #[Interceptor(Owner::class, Interceptor::TYPE_API)]
     public function security(Request $request): array
     {
         $post = $this->configPost(self::SECURITY_REQUEST_FIELDS, '安全设置');
 
-        $ipGetMode = $this->settingInteger($post, 'ip_get_mode', 0, 8, 'CDN 获取 IP 方式');
+        $ipGetMode = $this->settingInteger($post, 'ip_get_mode', 0, count(Client::HEADERS) - 1, 'CDN 获取 IP 方式');
+        //后台闲置锁屏分钟数：0=关闭，最长 1440(24 小时)；留空视为默认 15 分钟
+        $lockTimeout = $this->settingInteger($post, 'admin_lock_timeout', 0, 1440, '后台锁屏闲置分钟', 15);
         try {
             $trustedProxyConfig = Client::normalizeTrustedProxyConfig(
                 array_key_exists('trusted_proxy_ips', $post)
@@ -761,22 +793,28 @@ class Config extends Manage
             LinkDomainGuard::ENABLED_CONFIG => $this->settingBoolean($post, 'link_domain_filter'),
             LinkDomainGuard::WHITELIST_CONFIG => implode("\n", array_keys($normalized)),
             \App\Util\Csp::MODE_CONFIG => in_array(($m = trim($this->settingString($post, 'csp_mode', 16))), ['off', 'report', 'enforce'], true) ? $m : 'report',
+            //受信代理清单和 IP 获取方式必须一起落库：分两次写的话，前者成后者败会留下
+            //「模式改了、清单没改」的半截状态，而这两个值只有配套才有意义（#928）
+            Client::TRUSTED_PROXY_CONFIG => $trustedProxyConfig,
+            'admin_lock_timeout' => (string)$lockTimeout,
         ];
 
         try {
-            Client::setTrustedProxyConfig($trustedProxyConfig);
             CFG::putMany($settings);
         } catch (\Throwable $e) {
             throw new JSONException("保存失败，请检查原因");
         }
 
         Client::resetModeCache();
+        Client::resetTrustedProxyCache();
         LinkDomainGuard::resetCache();
         \App\Util\Csp::resetCache();
         ManageLog::log($this->getManage(), "修改了安全设置");
         return $this->json(200, '保存成功');
     }
 
+    //清请求日志=反取证，收敛到站长(type==0)本人（F-12）
+    #[Interceptor(Owner::class, Interceptor::TYPE_API)]
     public function requestLogClear(): array
     {
         if (strtoupper($this->request->method()) !== 'POST') {
@@ -798,6 +836,8 @@ class Config extends Manage
         ));
     }
 
+    //CSP 违规记录清空，收敛到站长(type==0)本人（F-12）
+    #[Interceptor(Owner::class, Interceptor::TYPE_API)]
     public function cspClear(): array
     {
         if (strtoupper($this->request->method()) !== 'POST') {
@@ -808,6 +848,234 @@ class Config extends Manage
         return $this->json(200, '已清空');
     }
 
+    /**
+     * 把一条违规记录加进对应种类的外部资源放行清单。
+     *
+     * 关键：入参是**违规记录的分组 key**，不是站长自己敲的域名。服务端拿 key 去违规库里
+     * 反查，只有本站真实请求过、真的被拦下来的外部地址才允许放行（脚本还必须发生在前台）——
+     * 站长因此填不宽也填不错，这是这套机制唯一的安全支点（GitHub #909）。
+     *
+     * @return array
+     * @throws JSONException
+     */
+    //CSP 脚本源加白=放行外部脚本来源，收敛到站长(type==0)本人（F-12）
+    #[Interceptor(Owner::class, Interceptor::TYPE_API)]
+    public function cspAllow(): array
+    {
+        if (strtoupper($this->request->method()) !== 'POST') {
+            throw new JSONException('仅接受 POST 请求');
+        }
+
+        $key = trim((string)($_POST['key'] ?? ''));
+        $grain = (string)($_POST['grain'] ?? 'dir');
+        if (!in_array($grain, ['file', 'dir', 'host'], true)) {
+            $grain = 'dir';
+        }
+
+        $row = null;
+        foreach (\App\Util\Csp::violations(1000) as $item) {
+            if (($item['key'] ?? '') === $key) {
+                $row = $item;
+                break;
+            }
+        }
+        if ($row === null) {
+            throw new JSONException('这条违规记录不存在，可能已被清空，请刷新后重试');
+        }
+        $kind = \App\Util\Csp::kindOf((string)($row['directive'] ?? ''));
+        if ($kind === null || !\App\Util\Csp::allowable($row)) {
+            throw new JSONException(
+                $kind === 'script' && str_starts_with((string)($row['document'] ?? ''), '/admin')
+                    ? '后台页面的脚本不能在这里放行。后台一律不加载第三方脚本；确有需要请用插件订阅 CSP_SOURCE_ALLOW 钩子。'
+                    : '这条违规不是外部地址被拦（比如内联脚本、eval），加白名单解决不了它。'
+            );
+        }
+
+        $source = \App\Util\Csp::deriveSource((string)$row['blocked'], $grain, $kind);
+        if ($source === '') {
+            throw new JSONException('无法从这条记录里解析出可放行的地址');
+        }
+
+        $list = \App\Util\Csp::allowList($kind);
+        if (in_array($source, $list, true)) {
+            return $this->json(200, '这个地址已经在放行清单里了', ['list' => $list]);
+        }
+        if (count($list) >= \App\Util\Csp::MAX_ALLOW) {
+            throw new JSONException('放行清单最多 ' . \App\Util\Csp::MAX_ALLOW . ' 条，请先移除不用的');
+        }
+
+        $list[] = $source;
+        $list = \App\Util\Csp::saveAllowList($list, $kind);
+
+        $label = \App\Util\Csp::KINDS[$kind]['label'];
+        ManageLog::log($this->getManage(), "[CSP]放行外部{$label}源 {$source}");
+        return $this->json(200, $kind === 'script' ? "已放行 {$source}，刷新前台页面即可生效" : "已放行 {$source}，刷新页面即可生效", ['list' => $list]);
+    }
+
+    /**
+     * 从放行清单里移除一条
+     * @return array
+     * @throws JSONException
+     */
+    //CSP 脚本源移除，收敛到站长(type==0)本人（F-12）
+    #[Interceptor(Owner::class, Interceptor::TYPE_API)]
+    public function cspAllowRemove(): array
+    {
+        if (strtoupper($this->request->method()) !== 'POST') {
+            throw new JSONException('仅接受 POST 请求');
+        }
+
+        $source = trim((string)($_POST['source'] ?? ''));
+        $kind = trim((string)($_POST['kind'] ?? 'script'));
+        if (!isset(\App\Util\Csp::KINDS[$kind])) {
+            throw new JSONException('这条放行记录不存在');
+        }
+        $list = \App\Util\Csp::allowList($kind);
+        if ($source === '' || !in_array($source, $list, true)) {
+            throw new JSONException('这条放行记录不存在');
+        }
+
+        $list = \App\Util\Csp::saveAllowList(array_values(array_diff($list, [$source])), $kind);
+        $label = \App\Util\Csp::KINDS[$kind]['label'];
+        ManageLog::log($this->getManage(), "[CSP]移除外部{$label}源 {$source}");
+        return $this->json(200, "已移除 {$source}", ['list' => $list]);
+    }
+
+    #[Interceptor(Owner::class, Interceptor::TYPE_API)]
+    public function cspAllowBlocked(): array
+    {
+        if (strtoupper($this->request->method()) !== 'POST') {
+            throw new JSONException('仅接受 POST 请求');
+        }
+
+        $directive = trim((string)($_POST['directive'] ?? ''));
+        $blocked = trim((string)($_POST['blocked'] ?? ''));
+        $kind = \App\Util\Csp::kindOf($directive);
+        if ($kind === null || $kind === 'script') {
+            throw new JSONException('这类内容不能在编辑器里放行，请到「安全设置 → 违规统计」里处理');
+        }
+
+        $source = \App\Util\Csp::deriveSource($blocked, 'host', $kind);
+        if ($source === '') {
+            throw new JSONException('无法从被拦地址里解析出可放行的域名');
+        }
+
+        $recorded = false;
+        foreach (\App\Util\Csp::violations(1000) as $row) {
+            if (($row['kind'] ?? '') === $kind && !empty($row['allowable'])
+                && \App\Util\Csp::deriveSource((string)($row['blocked'] ?? ''), 'host', $kind) === $source) {
+                $recorded = true;
+                break;
+            }
+        }
+        if (!$recorded) {
+            throw new JSONException('还没收到浏览器的拦截记录，请过几秒再试');
+        }
+
+        $list = \App\Util\Csp::allowList($kind);
+        if (!in_array($source, $list, true)) {
+            if (count($list) >= \App\Util\Csp::MAX_ALLOW) {
+                throw new JSONException('放行清单最多 ' . \App\Util\Csp::MAX_ALLOW . ' 条，请先到安全设置里移除不用的');
+            }
+            $list[] = $source;
+            $list = \App\Util\Csp::saveAllowList($list, $kind);
+            $label = \App\Util\Csp::KINDS[$kind]['label'];
+            ManageLog::log($this->getManage(), "[CSP]放行外部{$label}源 {$source}");
+        }
+
+        return $this->json(200, "已放行 {$source}，刷新页面后生效", ['source' => $source, 'list' => $list]);
+    }
+
+    public function linkDomainCheck(): array
+    {
+        if (strtoupper($this->request->method()) !== 'POST') {
+            throw new JSONException('仅接受 POST 请求');
+        }
+
+        $enabled = LinkDomainGuard::enabled();
+        $blocked = [];
+        if ($enabled) {
+            foreach ($this->linkDomainHosts() as $host) {
+                if (!LinkDomainGuard::allows($host)) {
+                    $blocked[] = $host;
+                }
+            }
+        }
+
+        return $this->json(200, 'success', [
+            'enabled' => $enabled,
+            'blocked' => $blocked,
+            'can_add' => (int)($this->getManage()?->type ?? -1) === 0,
+        ]);
+    }
+
+    #[Interceptor(Owner::class, Interceptor::TYPE_API)]
+    public function linkDomainAllow(): array
+    {
+        if (strtoupper($this->request->method()) !== 'POST') {
+            throw new JSONException('仅接受 POST 请求');
+        }
+
+        $hosts = $this->linkDomainHosts();
+        if ($hosts === []) {
+            throw new JSONException('没有可以加入白名单的域名');
+        }
+
+        $list = [];
+        foreach (preg_split('/[\r\n,]+/', (string)(CFG::cached(LinkDomainGuard::WHITELIST_CONFIG) ?? '')) ?: [] as $line) {
+            $line = trim((string)$line);
+            if ($line !== '') {
+                $list[$line] = true;
+            }
+        }
+
+        $added = [];
+        foreach ($hosts as $host) {
+            if (!LinkDomainGuard::allows($host)) {
+                $list[$host] = true;
+                $added[] = $host;
+            }
+        }
+        if ($added === []) {
+            return $this->json(200, '这些域名已经在白名单里了', ['added' => []]);
+        }
+
+        try {
+            CFG::put(LinkDomainGuard::WHITELIST_CONFIG, implode("\n", array_keys($list)));
+        } catch (\Throwable) {
+            throw new JSONException('保存失败，请检查原因');
+        }
+        LinkDomainGuard::resetCache();
+
+        ManageLog::log($this->getManage(), '[外链白名单]加入 ' . implode('、', $added));
+        return $this->json(200, '已加入外链白名单：' . implode('、', $added), ['added' => $added]);
+    }
+
+    private function linkDomainHosts(): array
+    {
+        $raw = $this->request->post('hosts');
+        if (!is_array($raw)) {
+            $raw = is_scalar($raw) && (string)$raw !== '' ? [$raw] : [];
+        }
+
+        $hosts = [];
+        foreach ($raw as $host) {
+            if (!is_scalar($host)) {
+                continue;
+            }
+            $host = strtolower(trim((string)$host, " \t\n\r\0\x0B."));
+            if ($host === '' || !preg_match('/^[a-z0-9._-]{1,253}$/', $host)) {
+                continue;
+            }
+            $hosts[$host] = true;
+            if (count($hosts) >= 50) {
+                break;
+            }
+        }
+        return array_keys($hosts);
+    }
+
+    #[Interceptor(Owner::class, Interceptor::TYPE_API)]
     public function other(): array
     {
         $map = $this->configPost(self::OTHER_REQUEST_FIELDS, '其他设置');
@@ -879,6 +1147,7 @@ class Config extends Manage
         return $this->json(200, '保存成功');
     }
 
+    #[Interceptor(Owner::class, Interceptor::TYPE_API)]
     public function currencyConvert(): array
     {
         $code = trim((string)($_POST['currency_code'] ?? ''));
@@ -922,6 +1191,8 @@ class Config extends Manage
         return $this->json(200, "成功", $list);
     }
 
+    //短信通道配置(含短信平台真实凭据)，收敛到站长(type==0)本人（F-12）
+    #[Interceptor(Owner::class, Interceptor::TYPE_API)]
     public function sms(): array
     {
         $map = $this->configPost(self::SMS_REQUEST_FIELDS, '短信设置');
@@ -996,6 +1267,8 @@ class Config extends Manage
         return $this->json(200, '保存成功');
     }
 
+    //邮箱通道配置(含 SMTP 真实凭据)，收敛到站长(type==0)本人（F-12）
+    #[Interceptor(Owner::class, Interceptor::TYPE_API)]
     public function email(): array
     {
         $map = $this->configPost(self::EMAIL_REQUEST_FIELDS, '邮箱设置');

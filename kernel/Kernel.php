@@ -20,6 +20,8 @@ const BASE_PATH = __DIR__ . "/../";
 require(BASE_PATH . '/vendor/autoload.php');
 require("Helper.php");
 
+App\Util\Client::guardHost();
+
 define("BASE_APP_SERVER", match ((int)config("store")['server']) {
     0 => App\Service\App::MAIN_SERVER,
     1 => App\Service\App::STANDBY_SERVER1,
@@ -33,7 +35,7 @@ session_set_cookie_params([
     'path' => '/',
     'httponly' => true,
     'samesite' => 'Lax',
-    'secure' => (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off'),
+    'secure' => App\Util\Client::isSecureRequest(),
 ]);
 session_name("ACG-SHOP");
 
@@ -52,10 +54,20 @@ try {
     }
 
     $routePath = (string)($_GET['s'] ?? '');
-    if (trim($routePath, "/ \t\n\r\0\x0B") === '') {
-        $routePath = "/user/index/index";
+    $routePath = implode("/", array_filter(
+        array_map(static fn($seg): string => trim((string)$seg), explode("/", $routePath)),
+        static fn(string $seg): bool => $seg !== ''
+    ));
+    if ($routePath === '') {
+        $routePath = "user/index/index";
     }
     $_GET['s'] = $routePath;
+    // File-card download link /download/<token>: the path stays as it is (plugins that act on
+    // storefront routes must not see a shop page); only the controller is pinned further down.
+    $_download = preg_match('~^download/([a-f0-9]{48})$~D', $routePath, $_downloadMatch) === 1;
+    if ($_download) {
+        $_GET['token'] = $_downloadMatch[1];
+    }
     Context::set(\Kernel\Context\Interface\Request::class, new Request());
     if (trim($routePath, "/") == 'admin') {
         header('location:' . "/admin/authentication/login");
@@ -92,6 +104,11 @@ try {
     $parameter = explode('.', $ends);
 
     $action = array_shift($parameter);
+
+    if ($_download) {
+        $controller = \App\Controller\User\Download::class;
+        $action = "file";
+    }
 
     $_GET["_PARAMETER"] = Firewall::inst()->xssKiller($parameter);
 
@@ -183,7 +200,7 @@ try {
 } catch (Throwable $e) {
     if ($e instanceof NotFoundException) {
         try {
-            $notFoundRoute = (string)(Context::get(Base::ROUTE) ?? ($_GET['s'] ?? ''));
+            $notFoundRoute = RequestLogger::maskDownloadTokens((string)(Context::get(Base::ROUTE) ?? ($_GET['s'] ?? '')));
             hook(\App\Consts\Hook::HTTP_NOT_FOUND, $notFoundRoute);
         } catch (Throwable $ignored) {
         }

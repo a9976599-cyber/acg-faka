@@ -95,6 +95,8 @@ abstract class User extends \App\Controller\Base\User
             }
 
             $data['static'] = "/app/View/User/Theme/" . $theme;
+            //让 Helper::themeUrl() 跟随这次真正渲染的主题（会员中心可能不是商城主题），否则资源会指到别的主题目录
+            \App\Util\Context::set(\App\Util\Helper::CURRENT_THEME, $theme);
 
             $domain = Client::getDomain();
             $business = Business::query()->where("subdomain", $domain)->first() ?? Business::query()->where("topdomain", $domain)->first();
@@ -138,6 +140,12 @@ abstract class User extends \App\Controller\Base\User
             } else {
                 $data['setting'] = $config['setting'];
             }
+
+            //语言切换器数据源。**必须以变量形式给模板**，不能让模板去调 lang_menu()：
+            //Smarty 在编译期就校验普通函数是否存在，模板一旦更新到只有旧核心的站点上，
+            //整页会抛 SmartyCompilerException 白屏；而未定义的变量只会渲染成空，最多是
+            //切换器不显示。模板是独立上架、可以先于核心更新的，这个降级路径必须留着。
+            $data['langs'] = \Kernel\Util\Lang::menu();
 
             $data = ViewSafe::escape($data);
 

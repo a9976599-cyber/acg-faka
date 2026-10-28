@@ -13,7 +13,10 @@ use Kernel\Util\View;
  */
 class Client
 {
-    private const HEADERS = [
+    /**
+     * 「CDN 获取 IP 方式」的取值就是这张表的下标，后台下拉选项也直接读它
+     */
+    public const HEADERS = [
         'REMOTE_ADDR',
         'HTTP_X_REAL_IP',
         'HTTP_X_FORWARDED_FOR',
@@ -22,12 +25,27 @@ class Client
         'HTTP_X_CLUSTER_CLIENT_IP',
         'HTTP_FORWARDED_FOR',
         'HTTP_FORWARDED',
-        'HTTP_CF_CONNECTING_IP'
+        'HTTP_CF_CONNECTING_IP',
+        'HTTP_CLOUDFRONT_VIEWER_ADDRESS'
     ];
 
     private const CHAIN_HEADER_MODES = [2, 4, 5, 6, 7];
-    private const TRUSTED_PROXY_FILE = BASE_PATH . '/runtime/trusted_proxies';
+
+
+    private const MODE_CLOUDFRONT = 9;
     public const MODE_CONFIG = 'ip_get_mode';
+
+    /**
+     * 受信代理清单的存放位置。
+     *
+     * 3.7.2 之前只写在 `runtime/trusted_proxies` 里。那是个所有人都当缓存看待、
+     * 部署/升级/重建容器随手就清掉的目录——清掉之后 isTrustedProxy() 恒为 false，
+     * getAddress() 会无条件退回 REMOTE_ADDR，站长配的「IP 获取方式」形同虚设，
+     * 订单 IP 全变成反代地址（issue #928）。安全配置必须落在配置表里。
+     * 老文件保留为读取兜底与一次性迁移来源。
+     */
+    public const TRUSTED_PROXY_CONFIG = 'trusted_proxy_ips';
+    private const LEGACY_TRUSTED_PROXY_FILE = BASE_PATH . '/runtime/trusted_proxies';
 
     private const LEGACY_MODE_FILE = BASE_PATH . '/runtime/mode';
 
@@ -104,9 +122,6 @@ class Client
     }
 
     /**
-     * 取值发生在 Request 构造期间——那时数据库连接还没建立，未安装的站点连库都没有。
-     * 所以这里走只读缓存，拿不到就退回旧的落地文件，任何一步失败都当作默认值 0。
-     *
      * @return int
      */
     private static function resolveClientMode(): int
@@ -216,12 +231,19 @@ class Client
     public static function setTrustedProxyConfig(string $config): void
     {
         $config = self::normalizeTrustedProxyConfig($config);
-        $written = file_put_contents(self::TRUSTED_PROXY_FILE, $config, LOCK_EX);
-        if ($written === false || $written !== strlen($config)) {
-            throw new \RuntimeException('受信代理清单写入失败');
-        }
-        self::$trustedProxyConfig = $config;
-        self::$trustedProxyRanges = $config === '' ? [] : explode("\n", $config);
+        Config::put(self::TRUSTED_PROXY_CONFIG, $config);
+        self::cacheTrustedProxyConfig($config);
+        //配置表已经是权威来源，老文件留着只会在 runtime 被清空时给出错误答案
+        @unlink(self::LEGACY_TRUSTED_PROXY_FILE);
+    }
+
+    /**
+     * 清掉进程内的受信代理缓存。配置在别处（批量保存）被改写后调用。
+     */
+    public static function resetTrustedProxyCache(): void
+    {
+        self::$trustedProxyConfig = null;
+        self::$trustedProxyRanges = null;
     }
 
     public static function getTrustedProxyConfig(): string
@@ -229,33 +251,66 @@ class Client
         if (self::$trustedProxyConfig !== null) {
             return self::$trustedProxyConfig;
         }
-        if (!file_exists(self::TRUSTED_PROXY_FILE)) {
-            self::$trustedProxyConfig = '';
-            self::$trustedProxyRanges = [];
-            return '';
+
+        $config = null;
+        if (self::configReadable()) {
+            try {
+                $config = Config::cached(self::TRUSTED_PROXY_CONFIG);
+            } catch (\Throwable) {
+                $config = null;
+            }
         }
 
-        $config = file_get_contents(self::TRUSTED_PROXY_FILE);
-        if ($config === false) {
-            self::$trustedProxyConfig = '';
-            self::$trustedProxyRanges = [];
-            return '';
+        if ($config === null) {
+            //老站的清单还在 runtime 文件里：读它，并趁这次把它搬进配置表。
+            //搬成功就删文件，所以整个站生命周期里最多发生一次。
+            $config = self::legacyTrustedProxyConfig();
+            if ($config !== '') {
+                self::migrateTrustedProxyConfig($config);
+            }
         }
 
         try {
-            self::$trustedProxyConfig = self::normalizeTrustedProxyConfig($config);
-            self::$trustedProxyRanges = self::$trustedProxyConfig === ''
-                ? []
-                : explode("\n", self::$trustedProxyConfig);
+            return self::cacheTrustedProxyConfig(self::normalizeTrustedProxyConfig($config));
         } catch (\InvalidArgumentException) {
             // A manually corrupted allowlist must fail closed.
-            self::$trustedProxyConfig = '';
-            self::$trustedProxyRanges = [];
+            return self::cacheTrustedProxyConfig('');
         }
-        return self::$trustedProxyConfig;
     }
 
-    private static function normalizeIp(string $value): ?string
+    private static function cacheTrustedProxyConfig(string $config): string
+    {
+        self::$trustedProxyConfig = $config;
+        self::$trustedProxyRanges = $config === '' ? [] : explode("\n", $config);
+        return $config;
+    }
+
+    private static function legacyTrustedProxyConfig(): string
+    {
+        if (!is_file(self::LEGACY_TRUSTED_PROXY_FILE)) {
+            return '';
+        }
+        $config = @file_get_contents(self::LEGACY_TRUSTED_PROXY_FILE);
+        return $config === false ? '' : $config;
+    }
+
+    /**
+     * 一次性迁移：把落地文件里的清单写进配置表并删掉文件。
+     * 失败（数据库还没连上、没有写权限）就当无事发生——这次仍然按文件里的值放行，
+     * 下一个请求再试。
+     */
+    private static function migrateTrustedProxyConfig(string $config): void
+    {
+        try {
+            Config::put(self::TRUSTED_PROXY_CONFIG, self::normalizeTrustedProxyConfig($config));
+            @unlink(self::LEGACY_TRUSTED_PROXY_FILE);
+        } catch (\Throwable) {
+            //保持原样，下次请求再迁
+        }
+    }
+
+    //公开给对接白名单（IpWhitelist）复用，保证会员登记的 IP 与 getAddress() 同一规范化口径
+    public static function normalizeIp(string $value): ?string
     {
         $value = trim($value, " \t\n\r\0\x0B\"");
         if ($value === '' || strtolower($value) === 'unknown' || str_starts_with($value, '_')) {
@@ -303,6 +358,15 @@ class Client
         if (strlen($value) > self::MAX_PROXY_HEADER_LENGTH) {
             return [];
         }
+        if ($type === self::MODE_CLOUDFRONT) {
+            //单值头：带逗号就不是 CloudFront 写的，整串作废
+            if (str_contains($value, ',')) {
+                return [];
+            }
+            $ip = self::normalizeIp(self::stripViewerPort($value));
+            return $ip === null ? [] : [$ip];
+        }
+
         $elements = explode(',', $value);
         if (count($elements) > self::MAX_PROXY_HEADER_ENTRIES) {
             return [];
@@ -336,7 +400,22 @@ class Client
         return $candidates;
     }
 
-    private static function ipMatchesRange(string $ip, string $range): bool
+    /**
+     * 去掉 CloudFront-Viewer-Address 末尾的端口：[IPv6]:端口、IPv4:端口、不带方括号的 IPv6:端口
+     */
+    private static function stripViewerPort(string $value): string
+    {
+        $value = trim($value);
+        if (preg_match('/^\[([0-9a-f:.]+)]:\d{1,5}$/iD', $value, $matches)) {
+            return $matches[1];
+        }
+        if (preg_match('/^([0-9a-f:.]+):\d{1,5}$/iD', $value, $matches)) {
+            return $matches[1];
+        }
+        return $value;
+    }
+
+    public static function ipMatchesRange(string $ip, string $range): bool
     {
         $parts = explode('/', $range, 2);
         $network = self::normalizeIp($parts[0]);
@@ -437,17 +516,99 @@ class Client
     }
 
     /**
+     * 判断当前请求是否通过 HTTPS 到达客户端。
+     *
+     * TLS 常在反向代理处终止，后端收到的连接仍是 HTTP。代理头只能在直连来源位于
+     * 后台配置的“受信代理”清单时使用，避免客户端伪造 X-Forwarded-Proto 后影响
+     * Secure Cookie 和回调地址。
+     */
+    public static function isSecureRequest(): bool
+    {
+        $https = strtolower(trim((string)($_SERVER['HTTPS'] ?? '')));
+        if ($https !== '' && $https !== 'off' && $https !== '0') {
+            return true;
+        }
+
+        if (strtolower(trim((string)($_SERVER['REQUEST_SCHEME'] ?? ''))) === 'https') {
+            return true;
+        }
+
+        $remoteAddress = self::normalizeIp((string)($_SERVER['REMOTE_ADDR'] ?? ''));
+        if ($remoteAddress === null || !self::isTrustedProxy($remoteAddress)) {
+            return false;
+        }
+
+        $forwardedProto = $_SERVER['HTTP_X_FORWARDED_PROTO'] ?? null;
+        if (is_scalar($forwardedProto) && strlen((string)$forwardedProto) <= 256) {
+            $proto = strtolower(trim(explode(',', (string)$forwardedProto, 2)[0]));
+            if (in_array($proto, ['http', 'https'], true)) {
+                return $proto === 'https';
+            }
+        }
+
+        $forwarded = $_SERVER['HTTP_FORWARDED'] ?? null;
+        if (!is_scalar($forwarded) || strlen((string)$forwarded) > self::MAX_PROXY_HEADER_LENGTH) {
+            return false;
+        }
+        $firstHop = explode(',', (string)$forwarded, 2)[0];
+        if (preg_match('/(?:^|;)\s*proto\s*=\s*"?(https?)"?(?:;|$)/i', $firstHop, $matches)) {
+            return strtolower($matches[1]) === 'https';
+        }
+        return false;
+    }
+
+    public static function getRequestScheme(): string
+    {
+        return self::isSecureRequest() ? 'https' : 'http';
+    }
+
+    /**
+     * @param string $host
+     * @return string|null 非法时返回 null
+     */
+    public static function normalizeHost(string $host): ?string
+    {
+        if ($host === '' || strlen($host) > 261) {
+            return null;
+        }
+        $pattern = '/^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_](?:[A-Za-z0-9_.-]{0,253}[A-Za-z0-9_])?\.?)(?::\d{1,5})?$/D';
+        return preg_match($pattern, $host) === 1 ? $host : null;
+    }
+    public static function guardHost(): void
+    {
+        $host = (string)($_SERVER['HTTP_HOST'] ?? '');
+        if ($host !== '' && self::normalizeHost($host) === null) {
+            http_response_code(400);
+            header('Content-Type: text/plain; charset=utf-8');
+            exit('400 Bad Request');
+        }
+
+        if (isset($_SERVER['HTTP_X_FORWARDED_HOST'])) {
+            foreach (explode(',', (string)$_SERVER['HTTP_X_FORWARDED_HOST']) as $forwarded) {
+                if (self::normalizeHost(trim($forwarded)) === null) {
+                    unset($_SERVER['HTTP_X_FORWARDED_HOST']);
+                    break;
+                }
+            }
+        }
+    }
+
+    /**
+     * 当前请求的 Host（含端口），非法时为空串
+     * @return string
+     */
+    public static function getHost(): string
+    {
+        return self::normalizeHost((string)($_SERVER['HTTP_HOST'] ?? '')) ?? '';
+    }
+
+    /**
      * 获取URL地址
      * @return string
      */
     public static function getUrl(): string
     {
-        if (strtolower((string)$_SERVER["HTTPS"]) == "on") {
-            $_SERVER['REQUEST_SCHEME'] = "https";
-        } elseif (!isset($_SERVER['REQUEST_SCHEME'])) {
-            $_SERVER['REQUEST_SCHEME'] = "http";
-        }
-        return $_SERVER['REQUEST_SCHEME'] . '://' . $_SERVER['HTTP_HOST'];
+        return self::getRequestScheme() . '://' . self::getHost();
     }
 
     /**
@@ -455,7 +616,7 @@ class Client
      */
     public static function getDomain(): string
     {
-        $host = explode(":", (string)$_SERVER['HTTP_HOST']);
+        $host = explode(":", self::getHost());
         return (string)$host[0];
     }
 

@@ -55,11 +55,359 @@ final class Schema
         }
     }
 
+    /**
+     * 会员登录会话表（与后台 manage_session 同构）。老站升级时 version/3.8.0/update.php 会建，
+     * 这里在签发会话前再兜一次，避免升级不完整时登录 500。用一次性标记，之后只花一次 is_file。
+     */
+    public static function ensureUserSessionTable(): void
+    {
+        $key = 'user_session';
+        if (isset(self::$checked[$key])) {
+            return;
+        }
+        self::$checked[$key] = true;
+
+        $mark = self::MARK_DIR . '/' . $key;
+        if (is_file($mark)) {
+            return;
+        }
+
+        try {
+            $schema = Manager::schema();
+            if (!$schema->hasTable('user_session')) {
+                $foreignPrefix = (string)Manager::connection()->getTablePrefix();
+                $schema->create('user_session', function (Blueprint $table) use ($foreignPrefix): void {
+                    $table->engine = 'InnoDB';
+                    $table->charset = 'utf8mb4';
+                    $table->collation = 'utf8mb4_general_ci';
+                    $table->bigIncrements('id')->comment('主键id');
+                    $table->unsignedInteger('user_id')->comment('会员id');
+                    $table->char('session_hash', 64)->comment('会话标识SHA-256哈希');
+                    $table->string('device_type', 16)->comment('设备类型');
+                    $table->string('device_name', 96)->comment('设备名称');
+                    $table->string('user_agent', 512)->comment('登录User-Agent');
+                    $table->string('login_ip', 45)->comment('登录IP');
+                    $table->string('last_ip', 45)->comment('最近IP');
+                    $table->dateTime('created_time')->comment('登录时间');
+                    $table->dateTime('last_seen_time')->comment('最近活跃时间');
+                    $table->dateTime('expires_time')->comment('过期时间');
+                    $table->dateTime('revoked_time')->nullable()->default(null)->comment('撤销时间');
+                    $table->unique('session_hash', 'session_hash');
+                    $table->index(['user_id', 'revoked_time', 'expires_time'], 'user_active');
+                    $table->index('last_seen_time', 'last_seen_time');
+                    $table->foreign('user_id', $foreignPrefix . 'user_session_ibfk_1')
+                        ->references('id')->on('user')->onDelete('cascade')->onUpdate('restrict');
+                });
+            }
+            if (!is_dir(self::MARK_DIR)) {
+                @mkdir(self::MARK_DIR, 0755, true);
+            }
+            @file_put_contents($mark, (string)time());
+        } catch (\Throwable $e) {
+            //建表失败（权限不足等）不写标记，下次再试；真正的错误交由后续查询暴露
+        }
+    }
+
+    /** 会员两步验证列（TOTP 密钥 + 备用恢复码）。登录与安全设置读写前先兜一次。 */
+    public static function ensureUserTotp(): void
+    {
+        self::ensureColumn('user', 'totp_secret', static function (Blueprint $table): void {
+            $table->string('totp_secret', 64)->nullable()->default(null)->comment('两步验证TOTP密钥(Base32)');
+        });
+        self::ensureColumn('user', 'totp_recovery', static function (Blueprint $table): void {
+            $table->text('totp_recovery')->nullable()->comment('两步验证备用恢复码(bcrypt哈希JSON)');
+        });
+        self::ensureColumn('user', 'fund_2fa', static function (Blueprint $table): void {
+            $table->unsignedTinyInteger('fund_2fa')->default(0)->comment('资金操作二次验证：0=关，1=开');
+        });
+    }
+
+    /**
+     * 会员安全稽核日志表（user_log）。写入点在登录/安全设置/资金操作等处，首次写入前兜底建表。
+     * 与 kernel/Install/Install.sql、version/3.8.1/update.php 三处定义保持一致。
+     */
+    public static function ensureUserLogTable(): void
+    {
+        $key = 'user_log';
+        if (isset(self::$checked[$key])) {
+            return;
+        }
+        self::$checked[$key] = true;
+
+        $mark = self::MARK_DIR . '/' . $key;
+        if (is_file($mark)) {
+            return;
+        }
+
+        try {
+            $schema = Manager::schema();
+            if (!$schema->hasTable('user_log')) {
+                $foreignPrefix = (string)Manager::connection()->getTablePrefix();
+                $schema->create('user_log', function (Blueprint $table) use ($foreignPrefix): void {
+                    $table->engine = 'InnoDB';
+                    $table->charset = 'utf8mb4';
+                    $table->collation = 'utf8mb4_general_ci';
+                    $table->bigIncrements('id')->comment('主键id');
+                    $table->unsignedInteger('user_id')->comment('会员id');
+                    $table->string('username', 32)->default('')->comment('会员用户名快照');
+                    $table->string('action', 32)->comment('事件类型码');
+                    $table->string('content', 255)->default('')->comment('日志详情');
+                    $table->dateTime('create_time')->comment('创建时间');
+                    $table->string('create_ip', 64)->comment('IP地址');
+                    $table->string('ua', 255)->nullable()->default(null)->comment('浏览器UA');
+                    $table->unsignedTinyInteger('risk')->default(0)->comment('风险：0=正常，1=异常');
+                    $table->index('user_id', 'user_id');
+                    $table->index('create_time', 'create_time');
+                    $table->index('action', 'action');
+                    $table->index('risk', 'risk');
+                    $table->foreign('user_id', $foreignPrefix . 'user_log_ibfk_1')
+                        ->references('id')->on('user')->onDelete('cascade')->onUpdate('restrict');
+                });
+            }
+            if (!is_dir(self::MARK_DIR)) {
+                @mkdir(self::MARK_DIR, 0755, true);
+            }
+            @file_put_contents($mark, (string)time());
+        } catch (\Throwable $e) {
+            //建表失败（权限不足等）不写标记，下次再试
+        }
+    }
+
+    /**
+     * 会员对接白名单 IP 表（user_ip_whitelist）。白名单读写与对接下单放行判定前兜底建表。
+     * 与 kernel/Install/Install.sql、version/3.8.2/update.php 三处定义保持一致。
+     */
+    public static function ensureUserIpWhitelistTable(): void
+    {
+        $key = 'user_ip_whitelist';
+        if (isset(self::$checked[$key])) {
+            return;
+        }
+        self::$checked[$key] = true;
+
+        $mark = self::MARK_DIR . '/' . $key;
+        if (is_file($mark)) {
+            return;
+        }
+
+        try {
+            $schema = Manager::schema();
+            if (!$schema->hasTable('user_ip_whitelist')) {
+                $foreignPrefix = (string)Manager::connection()->getTablePrefix();
+                $schema->create('user_ip_whitelist', function (Blueprint $table) use ($foreignPrefix): void {
+                    $table->engine = 'InnoDB';
+                    $table->charset = 'utf8mb4';
+                    $table->collation = 'utf8mb4_general_ci';
+                    $table->increments('id')->comment('主键id');
+                    $table->unsignedInteger('user_id')->comment('会员id');
+                    $table->string('ip', 64)->comment('IP或CIDR网段(规范化)');
+                    $table->string('note', 32)->default('')->comment('备注');
+                    $table->dateTime('create_time')->comment('添加时间');
+                    $table->dateTime('last_used_time')->nullable()->default(null)->comment('最近一次放行时间');
+                    $table->unique(['user_id', 'ip'], 'user_ip');
+                    $table->foreign('user_id', $foreignPrefix . 'user_ip_whitelist_ibfk_1')
+                        ->references('id')->on('user')->onDelete('cascade')->onUpdate('restrict');
+                });
+            }
+            if (!is_dir(self::MARK_DIR)) {
+                @mkdir(self::MARK_DIR, 0755, true);
+            }
+            @file_put_contents($mark, (string)time());
+        } catch (\Throwable $e) {
+            //建表失败（权限不足等）不写标记，下次再试
+        }
+    }
+
+    /**
+     * File-card archives (card_file). Ensured before uploads and stocking; identical to
+     * kernel/Install/Install.sql and version/3.8.4/update.php.
+     */
+    public static function ensureCardFileTable(): void
+    {
+        $key = 'card_file';
+        if (isset(self::$checked[$key])) {
+            return;
+        }
+        self::$checked[$key] = true;
+
+        $mark = self::MARK_DIR . '/' . $key;
+        if (is_file($mark)) {
+            return;
+        }
+
+        try {
+            $schema = Manager::schema();
+            if (!$schema->hasTable('card_file')) {
+                $schema->create('card_file', function (Blueprint $table): void {
+                    $table->engine = 'InnoDB';
+                    $table->charset = 'utf8mb4';
+                    $table->collation = 'utf8mb4_general_ci';
+                    $table->increments('id')->comment('主键id');
+                    $table->unsignedInteger('card_id')->nullable()->default(null)->comment('卡密id：NULL=已上传未入库');
+                    $table->unsignedInteger('order_id')->nullable()->default(null)->comment('发货订单id');
+                    $table->unsignedInteger('owner')->default(0)->comment('所属会员：0=系统');
+                    $table->char('token', 48)->comment('下载令牌');
+                    $table->string('path', 160)->comment('存储路径(runtime/card-file 下的随机文件名)');
+                    $table->string('name', 255)->comment('原文件名');
+                    $table->unsignedBigInteger('size')->default(0)->comment('文件大小(字节)');
+                    $table->char('hash', 64)->comment('SHA-256');
+                    $table->unsignedInteger('downloads')->default(0)->comment('下载次数');
+                    $table->dateTime('last_download_time')->nullable()->default(null)->comment('最近下载时间');
+                    $table->dateTime('create_time')->comment('上传时间');
+                    $table->unique('token', 'token');
+                    $table->unique('card_id', 'card_id');
+                    $table->index('order_id', 'order_id');
+                    $table->index('owner', 'owner');
+                    $table->index('hash', 'hash');
+                    $table->index('create_time', 'create_time');
+                });
+            }
+            if (!is_dir(self::MARK_DIR)) {
+                @mkdir(self::MARK_DIR, 0755, true);
+            }
+            @file_put_contents($mark, (string)time());
+            self::$tableKnown['card_file'] = true;
+        } catch (\Throwable $e) {
+            // Not marked: retried on the next request (missing CREATE privilege etc.).
+        }
+    }
+
+    /** 后台会话闲置锁屏所需的最近活动时间列。签发/校验会话前兜一次。 */
+    public static function ensureManageSessionActivity(): void
+    {
+        self::ensureColumn('manage_session', 'last_active_time', static function (Blueprint $table): void {
+            $table->dateTime('last_active_time')->nullable()->default(null)->comment('最近活动时间(闲置锁屏用)');
+        });
+    }
+
+    /**
+     * 后台 passkey(WebAuthn) 凭证表。注册/登入/解锁读写前先兜一次建表。
+     * 与 kernel/Install/Install.sql、version/3.8.1/update.php 三处定义保持一致。
+     */
+    public static function ensureManageWebauthnTable(): void
+    {
+        $key = 'manage_webauthn';
+        if (isset(self::$checked[$key])) {
+            return;
+        }
+        self::$checked[$key] = true;
+
+        $mark = self::MARK_DIR . '/' . $key;
+        if (is_file($mark)) {
+            return;
+        }
+
+        try {
+            $schema = Manager::schema();
+            if (!$schema->hasTable('manage_webauthn')) {
+                $foreignPrefix = (string)Manager::connection()->getTablePrefix();
+                $schema->create('manage_webauthn', function (Blueprint $table) use ($foreignPrefix): void {
+                    $table->engine = 'InnoDB';
+                    $table->charset = 'utf8mb4';
+                    $table->collation = 'utf8mb4_general_ci';
+                    $table->bigIncrements('id')->comment('主键id');
+                    $table->unsignedInteger('manage_id')->comment('管理员id');
+                    $table->string('credential_id', 255)->comment('凭证ID(base64url)');
+                    $table->text('public_key')->comment('凭证公钥(PEM)');
+                    $table->unsignedBigInteger('sign_count')->default(0)->comment('签名计数器');
+                    $table->string('transports', 128)->nullable()->default(null)->comment('传输方式');
+                    $table->string('aaguid', 64)->nullable()->default(null)->comment('认证器AAGUID');
+                    $table->string('name', 64)->default('')->comment('凭证标签');
+                    $table->dateTime('created_time')->comment('创建时间');
+                    $table->dateTime('last_used_time')->nullable()->default(null)->comment('最近使用时间');
+                    $table->string('last_used_ip', 45)->nullable()->default(null)->comment('最近使用IP');
+                    $table->unique('credential_id', 'credential_id');
+                    $table->index('manage_id', 'manage_id');
+                    $table->foreign('manage_id', $foreignPrefix . 'manage_webauthn_ibfk_1')
+                        ->references('id')->on('manage')->onDelete('cascade')->onUpdate('restrict');
+                });
+            }
+            if (!is_dir(self::MARK_DIR)) {
+                @mkdir(self::MARK_DIR, 0755, true);
+            }
+            @file_put_contents($mark, (string)time());
+        } catch (\Throwable $e) {
+            //建表失败（权限不足等）不写标记，下次再试
+        }
+    }
+
+    /**
+     * 会员 passkey(WebAuthn) 凭证表（与后台 manage_webauthn 同构）。注册/登录读写前先兜一次建表。
+     * 与 kernel/Install/Install.sql、version/3.8.1/update.php 三处定义保持一致。
+     */
+    public static function ensureUserWebauthnTable(): void
+    {
+        $key = 'user_webauthn';
+        if (isset(self::$checked[$key])) {
+            return;
+        }
+        self::$checked[$key] = true;
+
+        $mark = self::MARK_DIR . '/' . $key;
+        if (is_file($mark)) {
+            return;
+        }
+
+        try {
+            $schema = Manager::schema();
+            if (!$schema->hasTable('user_webauthn')) {
+                $foreignPrefix = (string)Manager::connection()->getTablePrefix();
+                $schema->create('user_webauthn', function (Blueprint $table) use ($foreignPrefix): void {
+                    $table->engine = 'InnoDB';
+                    $table->charset = 'utf8mb4';
+                    $table->collation = 'utf8mb4_general_ci';
+                    $table->bigIncrements('id')->comment('主键id');
+                    $table->unsignedInteger('user_id')->comment('会员id');
+                    $table->string('credential_id', 255)->comment('凭证ID(base64url)');
+                    $table->text('public_key')->comment('凭证公钥(PEM)');
+                    $table->unsignedBigInteger('sign_count')->default(0)->comment('签名计数器');
+                    $table->string('transports', 128)->nullable()->default(null)->comment('传输方式');
+                    $table->string('aaguid', 64)->nullable()->default(null)->comment('认证器AAGUID');
+                    $table->string('name', 64)->default('')->comment('凭证标签');
+                    $table->dateTime('created_time')->comment('创建时间');
+                    $table->dateTime('last_used_time')->nullable()->default(null)->comment('最近使用时间');
+                    $table->string('last_used_ip', 45)->nullable()->default(null)->comment('最近使用IP');
+                    $table->unique('credential_id', 'credential_id');
+                    $table->index('user_id', 'user_id');
+                    $table->foreign('user_id', $foreignPrefix . 'user_webauthn_ibfk_1')
+                        ->references('id')->on('user')->onDelete('cascade')->onUpdate('restrict');
+                });
+            }
+            if (!is_dir(self::MARK_DIR)) {
+                @mkdir(self::MARK_DIR, 0755, true);
+            }
+            @file_put_contents($mark, (string)time());
+        } catch (\Throwable $e) {
+            //建表失败（权限不足等）不写标记，下次再试
+        }
+    }
+
     /** 商品标签（#807）。列表与详情都要读，所以两边入口都得先叫一声 */
     public static function ensureCommodityTags(): void
     {
         self::ensureColumn('commodity', 'tags', static function (Blueprint $table): void {
             $table->string('tags', 1000)->nullable()->comment('商品标签：JSON [{text,color}]');
+        });
+    }
+
+    public static function ensureCommodityControl(): void
+    {
+        self::ensureColumn('commodity', 'substation_disable', static function (Blueprint $table): void {
+            $table->unsignedTinyInteger('substation_disable')->default(0)->comment('禁止分站销售：0=否，1=是');
+        });
+        self::ensureColumn('commodity', 'ban', static function (Blueprint $table): void {
+            $table->unsignedTinyInteger('ban')->default(0)->comment('平台下架：0=否，1=是');
+        });
+        self::ensureColumn('commodity', 'ban_reason', static function (Blueprint $table): void {
+            $table->string('ban_reason', 255)->charset('utf8mb4')->collation('utf8mb4_general_ci')->nullable()->comment('平台下架原因');
+        });
+    }
+
+    /** 手动发货商品「付款即发货」：付款后直接把发货信息作为卡密发出、订单即为已发货（3.8.3） */
+    public static function ensureCommodityDeliveryAuto(): void
+    {
+        self::ensureColumn('commodity', 'delivery_auto', static function (Blueprint $table): void {
+            $table->unsignedTinyInteger('delivery_auto')->default(0)->comment('手动发货付款即发货：0=否，1=是')->after('delivery_message');
         });
     }
 
@@ -71,6 +419,21 @@ final class Schema
         });
         self::ensureColumn('shared', 'currency_rate', static function (Blueprint $table): void {
             $table->decimal('currency_rate', 18, 6)->default(0)->comment('结算汇率：1 上游货币 = ? 本站货币；0 = 按站点汇率自动');
+        });
+    }
+
+    /**
+     * 上游协议代次（店铺共享）。
+     *
+     * `/shared/commodity/item` 的入参与返回形状在 3.1.2 变过，`stock`/`draft`/`valuation`
+     * 三个端点也是那之后才有的。每次都先打一发新端点再吃 404 的话，商品详情页每次访问
+     * 都要多一次往返；探明一次记在店铺档案上，之后直奔正确的那条路。
+     * 0=未探明，1=3.1.2 及以后，2=3.1.1 及更老。
+     */
+    public static function ensureSharedProtocol(): void
+    {
+        self::ensureColumn('shared', 'protocol', static function (Blueprint $table): void {
+            $table->unsignedTinyInteger('protocol')->default(0)->comment('上游协议代次：0=未探明，1=3.1.2+，2=3.1.1及更老');
         });
     }
 

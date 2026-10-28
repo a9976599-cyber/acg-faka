@@ -12,6 +12,27 @@ final class Csp
 
     public const MODE_CONFIG = 'csp_mode';
 
+    /**
+     * 站长放行的外部脚本源（换行分隔）。
+     *
+     * 只能通过「违规记录 → 允许」写入，没有自由输入的入口——这是这套机制唯一的安全支点：
+     * 白名单里只可能出现本站真实请求过、并且真的被拦下来的地址，站长填不宽也填不错。
+     * 详见 GitHub #909。
+     */
+    public const ALLOW_CONFIG = 'csp_script_allow';
+
+    /** 单站最多放行多少条，防止越攒越乱 */
+    public const MAX_ALLOW = 30;
+
+    public const KINDS = [
+        'script' => ['directives' => ['script-src', 'script-src-elem', 'worker-src'], 'feeds' => ['script-src', 'worker-src'], 'config' => self::ALLOW_CONFIG, 'label' => '脚本', 'frontOnly' => true],
+        'frame' => ['directives' => ['frame-src', 'child-src'], 'feeds' => ['frame-src'], 'config' => 'csp_frame_allow', 'label' => '框架', 'frontOnly' => false],
+        'style' => ['directives' => ['style-src', 'style-src-elem'], 'feeds' => ['style-src'], 'config' => 'csp_style_allow', 'label' => '样式', 'frontOnly' => false],
+        'font' => ['directives' => ['font-src'], 'feeds' => ['font-src'], 'config' => 'csp_font_allow', 'label' => '字体', 'frontOnly' => false],
+        'media' => ['directives' => ['media-src'], 'feeds' => ['media-src'], 'config' => 'csp_media_allow', 'label' => '音视频', 'frontOnly' => false],
+        'connect' => ['directives' => ['connect-src'], 'feeds' => ['connect-src'], 'config' => 'csp_connect_allow', 'label' => '网络请求', 'frontOnly' => false],
+    ];
+
     public const REPORT_PATH = '/csp/report';
 
     private const STORE = BASE_PATH . '/runtime/csp/violations.json';
@@ -128,7 +149,7 @@ final class Csp
                 'path' => '/',
                 'httponly' => true,
                 'samesite' => 'Lax',
-                'secure' => (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off'),
+                'secure' => Client::isSecureRequest(),
             ]);
         }
         return $fresh;
@@ -183,6 +204,9 @@ final class Csp
 
     private static ?array $extraCache = null;
 
+    /** 支付跳转页（Submit.html）本次要放行的网关 origin，只进这一次响应的 form-action */
+    private static array $extraFormAction = [];
+
     /**
      * 收集插件声明的放行域名。任何一步出错都退回空清单——策略头绝不能因为
      * 某个插件写错而发不出去。
@@ -198,6 +222,22 @@ final class Csp
         $collected = [];
         try {
             $sources = array_fill_keys(self::EXTENSIBLE, []);
+
+            //站长在「违规记录」里点允许的外部脚本源。
+            //**只在前台生效**：后台 XSS 直接拿管理员会话，代价比前台高一个量级，而挂件、
+            //统计脚本这类需求 100% 在前台模板里。后台真要加载第三方脚本，走下面那个插件钩子。
+            $admin = str_starts_with((string)getLocalRouter(), '/admin');
+            foreach (self::KINDS as $kind => $spec) {
+                if ($spec['frontOnly'] && $admin) {
+                    continue;
+                }
+                foreach (self::allowList($kind) as $source) {
+                    foreach ($spec['feeds'] as $feed) {
+                        $sources[$feed][] = $source;
+                    }
+                }
+            }
+
             hook(\App\Consts\Hook::CSP_SOURCE_ALLOW, $sources);
 
             foreach (self::EXTENSIBLE as $directive) {
@@ -221,6 +261,35 @@ final class Csp
         }
 
         return self::$extraCache = array_map('array_keys', $collected);
+    }
+
+    /**
+     * 支付表单跳转页（Submit.html）专用：把本次要 POST 过去的网关 origin 加进 form-action，
+     * 并立刻重发一次 CSP 头覆盖掉 Kernel 初始化时发的那条（form-action 'self'）。全站 form-action
+     * 仍保持 'self'——只有这一个服务端生成、无用户内容的跳转页放行它那一个网关。网关地址取自
+     * order.pay_url（下单时由支付插件回填，非用户每请求可控）。修「码支付等 submit 表单支付卡单」。
+     */
+    public static function allowPaymentGateway(string $url): void
+    {
+        if (!self::enabled()) {
+            return; //CSP 关闭时 Kernel 没发完整策略，表单本来就能提交
+        }
+        $url = trim($url);
+        $host = strtolower((string)parse_url($url, PHP_URL_HOST));
+        $scheme = strtolower((string)parse_url($url, PHP_URL_SCHEME));
+        if ($host === '' || !in_array($scheme, ['http', 'https'], true)) {
+            return; //取不到网关 origin（相对地址 / 非 http(s)）：form-action 维持 'self'
+        }
+        $port = parse_url($url, PHP_URL_PORT);
+        $origin = $scheme . '://' . $host . ($port ? ':' . (int)$port : '');
+        //只收 scheme://host[:port] 的纯净 origin，杜绝借畸形 URL 往头里塞别的
+        if (!preg_match('#^https?://[a-z0-9.\-]+(?::\d{1,5})?$#', $origin)) {
+            return;
+        }
+        self::$extraFormAction[$origin] = true;
+        if (!headers_sent()) {
+            header(self::header() . ': ' . self::policy());
+        }
     }
 
     public static function policy(): string
@@ -247,7 +316,7 @@ final class Csp
             "frame-ancestors 'self'",
             "object-src 'none'",
             "base-uri 'self'",
-            "form-action 'self'",
+            "form-action " . trim("'self' " . implode(' ', array_keys(self::$extraFormAction))),
             'report-uri ' . self::REPORT_PATH,
         ]);
     }
@@ -299,7 +368,139 @@ final class Csp
     {
         $store = self::read();
         uasort($store, static fn(array $a, array $b): int => ($b['count'] ?? 0) <=> ($a['count'] ?? 0));
-        return array_slice(array_values($store), 0, max(1, $limit));
+
+        $rows = [];
+        foreach ($store as $key => $row) {
+            //把分组 key 带出去，前端「允许」按钮要靠它指回这一条
+            $row['key'] = (string)$key;
+            $row['kind'] = self::kindOf((string)($row['directive'] ?? '')) ?? '';
+            $row['allowable'] = self::allowable($row);
+            if ($row['allowable']) {
+                foreach (['file', 'dir', 'host'] as $grain) {
+                    $row['grains'][$grain] = self::deriveSource((string)($row['blocked'] ?? ''), $grain, $row['kind']);
+                }
+            }
+            $rows[] = $row;
+        }
+        return array_slice($rows, 0, max(1, $limit));
+    }
+
+    public static function kindOf(string $directive): ?string
+    {
+        foreach (self::KINDS as $kind => $spec) {
+            if (in_array($directive, $spec['directives'], true)) {
+                return $kind;
+            }
+        }
+        return null;
+    }
+
+    public static function allowable(array $row): bool
+    {
+        $kind = self::kindOf((string)($row['directive'] ?? ''));
+        if ($kind === null) {
+            return false;
+        }
+        if (self::KINDS[$kind]['frontOnly'] && str_starts_with((string)($row['document'] ?? ''), '/admin')) {
+            return false;
+        }
+        return self::deriveSource((string)($row['blocked'] ?? ''), 'dir', $kind) !== '';
+    }
+
+    /**
+     * 把被拦下来的完整地址收敛成一条 CSP 源表达式。
+     *
+     * @param string $blocked 违规记录里的被拦地址
+     * @param string $grain file=只这个文件 / dir=该目录（默认）/ host=整个域名
+     * @return string 非法返回空串
+     */
+    public static function deriveSource(string $blocked, string $grain = 'dir', string $kind = 'script'): string
+    {
+        $parts = parse_url(trim($blocked));
+        if (!is_array($parts)) {
+            return '';
+        }
+        $scheme = strtolower((string)($parts['scheme'] ?? ''));
+        $host = strtolower((string)($parts['host'] ?? ''));
+        if (!in_array($scheme, ['http', 'https'], true) || $host === '' || !str_contains($host, '.')) {
+            return '';
+        }
+        //第三方脚本源一定是个域名。IP 字面量和保留域（localhost/内网/测试域）不该进白名单——
+        //那多半是开发遗留，真放进去也只会解析到访客自己的机器上
+        if (filter_var($host, FILTER_VALIDATE_IP) !== false || str_starts_with($host, '[')) {
+            return '';
+        }
+        $tld = substr($host, (int)strrpos($host, '.') + 1);
+        if (in_array($tld, ['localhost', 'local', 'internal', 'intranet', 'test', 'invalid', 'example', 'lan', 'home'], true)) {
+            return '';
+        }
+
+        //脚本一律按 https 放行：http 脚本在 https 站上本来就会被混合内容拦掉，
+        //不写 scheme 的话 CSP 会把 http 一起放行，白扩一片匹配面
+        $scheme = $kind === 'script' ? 'https' : $scheme;
+        $origin = $scheme . '://' . $host;
+        $port = (int)($parts['port'] ?? 0);
+        if ($port > 0 && $port !== ($scheme === 'https' ? 443 : 80)) {
+            $origin .= ':' . $port;
+        }
+
+        $path = (string)($parts['path'] ?? '');
+        $source = match ($grain) {
+            'file' => $path === '' ? $origin : $origin . $path,
+            //目录级：扛得住厂商发版换文件名(hash)，又不是整站放行
+            'dir' => $origin . (($slash = strrpos($path, '/')) === false ? '/' : substr($path, 0, $slash + 1)),
+            default => $origin,
+        };
+
+        return preg_match(self::SOURCE_PATTERN, $source) ? $source : '';
+    }
+
+    public static function allowList(string $kind = 'script'): array
+    {
+        if (!isset(self::KINDS[$kind])) {
+            return [];
+        }
+        try {
+            $raw = (string)(Config::cached(self::KINDS[$kind]['config']) ?? '');
+        } catch (\Throwable) {
+            return [];
+        }
+
+        $out = [];
+        foreach (preg_split('/[\r\n,]+/', $raw) ?: [] as $line) {
+            $line = trim($line);
+            if ($line !== '' && preg_match(self::SOURCE_PATTERN, $line)) {
+                $out[$line] = true;
+            }
+        }
+        return array_slice(array_keys($out), 0, self::MAX_ALLOW);
+    }
+
+    /**
+     * 覆盖写入放行清单。只有后台「违规记录 → 允许 / 移除」会调用。
+     * @param string[] $sources
+     * @return string[] 实际落库的清单
+     */
+    public static function saveAllowList(array $sources, string $kind = 'script'): array
+    {
+        if (!isset(self::KINDS[$kind])) {
+            throw new \InvalidArgumentException('unknown csp allow kind');
+        }
+        $clean = [];
+        foreach ($sources as $source) {
+            if (!is_string($source)) {
+                continue;
+            }
+            $source = trim($source);
+            if ($source !== '' && preg_match(self::SOURCE_PATTERN, $source)) {
+                $clean[$source] = true;
+            }
+        }
+        $clean = array_slice(array_keys($clean), 0, self::MAX_ALLOW);
+
+        Config::put(self::KINDS[$kind]['config'], implode("\n", $clean));
+        self::$extraCache = null;
+        return $clean;
     }
 
     public static function summary(): array

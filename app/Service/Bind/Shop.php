@@ -124,6 +124,7 @@ class Shop implements \App\Service\Shop
     public function getItem(int|string $commodityId, ?User $user = null, ?UserGroup $group = null): array
     {
         \App\Util\Schema::ensureCommodityTags();
+        \App\Util\Schema::ensureCommodityControl();
 
         $commodity = Commodity::query()->with(['owner' => function (Relation $relation) {
             $relation->select(["id", "username", "avatar"]);
@@ -134,7 +135,7 @@ class Shop implements \App\Service\Shop
                 "level_disable", "coupon", "shared_id", "shared_code", "shared_premium", "shared_premium_type", "seckill_status",
                 "seckill_start_time", "seckill_end_time", "draft_status", "draft_premium", "inventory_hidden",
                 "widget", "minimum", "maximum", "shared_sync", "config", "stock", "code", "shared_amount_sync", "shared_config_sync",
-                "tags"])
+                "tags", "substation_disable"])
             ->withCount(['order as order_sold' => function (Builder $relation) {
                 $relation->where("delivery_status", 1);
             }]);
@@ -151,6 +152,11 @@ class Shop implements \App\Service\Shop
 
         if ($commodity->status != 1) {
             throw new JSONException("该商品暂未上架");
+        }
+
+        $substation = Business::get();
+        if ($substation && !$substation->sells($commodity)) {
+            throw new JSONException("商品不存在");
         }
 
         $shared = \App\Model\Shared::query()->find($commodity->shared_id);
@@ -180,6 +186,10 @@ class Shop implements \App\Service\Shop
             throw new JSONException("该商品配置异常，请商家检查商品[{$commodity->id}]的批发/规格/会员价配置：" . $e->getMessage());
         }
 
+        //会员价留空(0)时回退零售价——必须在分站加价之前归一，
+        //否则前台会显示 0 元而下单按零售价收费，两边对不上
+        $commodity->user_price = $commodity->memberPrice();
+
         $this->substationPriceIncrease($commodity);
 
         $commodity->service_url = Config::get("service_url");
@@ -190,15 +200,6 @@ class Shop implements \App\Service\Shop
         }
 
         $array = $commodity->toArray();
-
-        if (isset($array['config']) && is_array($array['config'])) {
-            foreach ([
-                'category_factory', 'wholesale_factory', 'category_wholesale_factory', 'sku_factory',
-                'category_cost', 'sku_cost', 'shared_mapping',
-            ] as $section) {
-                unset($array['config'][$section]);
-            }
-        }
 
         if ($array["owner"]) {
             $business = Business::query()->where("user_id", $array["owner"]['id'])->first();
@@ -233,7 +234,11 @@ class Shop implements \App\Service\Shop
 
         $array['tags'] = Commodity::parseTags($array['tags'] ?? null);
 
-        return $array;
+        //出站清洗放在最后一步：description 要等 RichHtml 处理完、cover 要等空值兜底完。
+        //这条路同时供免登录的前台商品详情和店铺共享的 item 接口使用，两边都不能看到
+        //shared_*（转售身份与上游商品编号）、level_price（会员定价结构）和 config 里的
+        //成本段；详情里的上游图片直链也在这里抹掉。见 App\Util\SharedPayload。
+        return \App\Util\SharedPayload::detail($array);
     }
 
     public function getHideStock(int|string|null $stock): string
@@ -277,9 +282,14 @@ class Shop implements \App\Service\Shop
             return $this->getSharedStock($commodity, $race, $sku);
         } else if ($commodity->delivery_way == 0) {
             $card = Card::query()->where("commodity_id", $commodity->id)->where("status", 0);
-            if ($race) $card = $card->where("race", $race);
+            //和拉卡同口径：商品现在没有种类时，卡上残留的旧种类不算数
+            if ($race && \App\Util\Sku::hasCategories(\App\Util\Sku::selectionConfig($commodity))) $card = $card->where("race", $race);
             if (!empty($sku)) {
                 foreach ($sku as $k => $v) {
+                    //$k 来自客户端，拼进 JSON 路径 sku->{$k}；非法键会触发坏 JSON 路径→500。按 SKU 键名规则校验。
+                    if (!\App\Util\Sku::isValidKey((string)$k)) {
+                        throw new JSONException("规格参数不正确");
+                    }
                     $card = $card->where("sku->{$k}", $v);
                 }
             }
@@ -339,7 +349,7 @@ class Shop implements \App\Service\Shop
         return $commodity->shared_stock[$hash];
     }
 
-    public function getDraft(Commodity|int|string $commodity, int $cardId): array
+    public function getDraft(Commodity|int|string $commodity, int $cardId, ?string $race = null, ?array $sku = null): array
     {
         if (is_int($commodity)) {
             $commodity = Commodity::query()->find($commodity);
@@ -357,6 +367,13 @@ class Shop implements \App\Service\Shop
 
         if ($card->status != 0) {
             throw new JSONException("此宝贝已被他人抢走");
+        }
+
+        //只按卡号算溢价会让「便宜又有货的规格 + 贵规格的卡号」按便宜价成交，所以要确认卡正是所选规格。
+        //种类与规格都为 null 只出现在对接接口应答旧版下游的询价：它们不带规格，上游下单时仍会比对。
+        if (($race !== null || $sku !== null)
+            && !\App\Util\Sku::cardSelectable((int)$card->id, $race, $sku, \App\Util\Sku::selectionConfig($commodity))) {
+            throw new JSONException(\App\Util\Sku::DRAFT_MISMATCH);
         }
 
         return ["draft_premium" => $card->draft_premium, "cost" => $card->cost];
@@ -387,29 +404,29 @@ class Shop implements \App\Service\Shop
         $config = $commodity->config ?: [];
 
         if ($userCommodity->premium > 0) {
-            $commodity->price = $userCommodity->applyRounding((new Decimal($commodity->price))->mul($userCommodity->premium / 100)->add($commodity->price)->getAmount());
-            $commodity->user_price = $userCommodity->applyRounding((new Decimal($commodity->user_price))->mul($userCommodity->premium / 100)->add($commodity->user_price)->getAmount());
+            $commodity->price = $userCommodity->markup($commodity->price);
+            $commodity->user_price = $userCommodity->markup($commodity->user_price);
 
             if ($commodity->draft_premium > 0) {
-                $commodity->draft_premium = $userCommodity->applyRounding((new Decimal($commodity->draft_premium))->mul($userCommodity->premium / 100)->add($commodity->draft_premium)->getAmount());
+                $commodity->draft_premium = $userCommodity->markup($commodity->draft_premium);
             }
 
             if (is_array($config['category'])) {
                 foreach ($config['category'] as &$price) {
-                    $price = $userCommodity->applyRounding((new Decimal($price))->mul($userCommodity->premium / 100)->add($price)->getAmount());
+                    $price = $userCommodity->markup($price);
                 }
             }
 
             if (is_array($config['wholesale'])) {
                 foreach ($config['wholesale'] as &$price) {
-                    $price = $userCommodity->applyRounding((new Decimal($price))->mul($userCommodity->premium / 100)->add($price)->getAmount());
+                    $price = $userCommodity->markup($price);
                 }
             }
 
             if (is_array($config['category_wholesale'])) {
                 foreach ($config['category_wholesale'] as &$arr) {
                     foreach ($arr as &$price) {
-                        $price = $userCommodity->applyRounding((new Decimal($price))->mul($userCommodity->premium / 100)->add($price)->getAmount());
+                        $price = $userCommodity->markup($price);
                     }
                 }
             }
@@ -417,7 +434,7 @@ class Shop implements \App\Service\Shop
             if (is_array($config['sku'])) {
                 foreach ($config['sku'] as &$arr) {
                     foreach ($arr as &$price) {
-                        $price = $userCommodity->applyRounding((new Decimal($price))->mul($userCommodity->premium / 100)->add($price)->getAmount());
+                        $price = $userCommodity->markup($price);
                     }
                 }
             }
@@ -449,7 +466,7 @@ class Shop implements \App\Service\Shop
         }
 
         if ($userCommodity->premium > 0) {
-            return $userCommodity->applyRounding((new Decimal($amount))->mul($userCommodity->premium / 100)->add($amount)->getAmount());
+            return $userCommodity->markup($amount);
         }
 
         return (string)$amount;

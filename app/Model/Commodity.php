@@ -27,6 +27,7 @@ use Kernel\Exception\JSONException;
  * @property int $delivery_way
  * @property int $delivery_auto_mode
  * @property string $delivery_message
+ * @property int $delivery_auto
  * @property int $contact_type
  * @property int $sort
  * @property int $password_status
@@ -89,6 +90,7 @@ class Commodity extends Model
         'integral' => 'integer',
         'delivery_way' => 'integer',
         'delivery_auto_mode' => 'integer',
+        'delivery_auto' => 'integer',
         'contact_type' => 'integer',
         'sort' => 'integer',
         'coupon' => 'integer',
@@ -108,6 +110,8 @@ class Commodity extends Model
         'shared_amount_sync' => 'integer',
         'shared_config_sync' => 'integer',
         'shared_sync' => 'integer',
+        'substation_disable' => 'integer',
+        'ban' => 'integer',
         'shared_stock' => 'json'
     ];
 
@@ -183,6 +187,34 @@ class Commodity extends Model
     }
 
     /**
+     * 「付款即发货」：手动发货商品付款后直接把发货信息作为卡密发出，订单即为已发货。
+     * 后台与商户端保存共用。只在本次提交动到发货方式 / 开关 / 发货信息时校验最终状态，
+     * 表格里只提交 id + 单个字段的快捷开关不受影响。
+     * @param array $map 待保存字段（会把 delivery_auto 归一成 0/1）
+     * @param Commodity|null $current 修改时的原商品
+     * @throws JSONException
+     */
+    public static function assertDeliveryAuto(array &$map, ?self $current): void
+    {
+        if (array_key_exists('delivery_auto', $map)) {
+            $map['delivery_auto'] = (int)$map['delivery_auto'] === 1 ? 1 : 0;
+        }
+        //delivery_message 是 varchar(255)：超长时严格模式直接报错，非严格模式会被悄悄截断——发出去的下载链接就残了
+        if (array_key_exists('delivery_message', $map) && mb_strlen((string)$map['delivery_message']) > 255) {
+            throw new JSONException("发货信息最多255个字");
+        }
+        if (!array_key_exists('delivery_way', $map) && !array_key_exists('delivery_auto', $map) && !array_key_exists('delivery_message', $map)) {
+            return;
+        }
+        $way = (int)($map['delivery_way'] ?? $current?->delivery_way ?? 0);
+        $auto = (int)($map['delivery_auto'] ?? $current?->delivery_auto ?? 0);
+        $message = (string)($map['delivery_message'] ?? $current?->delivery_message ?? '');
+        if ($way === 1 && $auto === 1 && trim($message) === '') {
+            throw new JSONException("开启了付款即发货，请填写发货信息");
+        }
+    }
+
+    /**
      * 校验会员等级独立配置(level_price)的数据格式，非法时抛出异常。
      * 该字段运行时会经 parseGroupConfig -> Ini::toArray 解析，脏数据一旦入库，
      * 登录用户的商品列表和详情会整体报错，所以必须在保存入口拦截。
@@ -205,10 +237,46 @@ class Commodity extends Model
             if (!is_array($var)) {
                 throw new JSONException("会员等级[{$groupId}]的配置格式错误");
             }
+            if (isset($var['amount']) && trim((string)$var['amount']) !== '' && !preg_match('/^\d+(\.\d{1,2})?$/', trim((string)$var['amount']))) {
+                throw new JSONException("会员等级[{$groupId}]的价格必须是不小于0且最多两位小数的数字");
+            }
             try {
-                Ini::toArray((string)($var['config'] ?? ""));
+                $parsed = Ini::toArray((string)($var['config'] ?? ""));
             } catch (JSONException $e) {
                 throw new JSONException("会员等级[{$groupId}]的独立配置解析失败：" . $e->getMessage());
+            }
+            //level_price 的内层 config 会经 parseGroupConfig() 合并成有效配置参与估价，是与顶层 config
+            //同源的负价通道。此前只查语法不查价格：商户在这里填负价→买家估价变负→amount<=0 免支付直发。
+            //与顶层 config 同口径校验各价格档非负。
+            self::assertConfigPricesNonNegative($parsed);
+        }
+    }
+
+    /**
+     * 校验（已解析的）商品配置里各价格档为「不小于 0 的数字」。
+     *
+     * category/wholesale/category_wholesale 的值是成交单价、sku 的值是溢价，任一为负或非数字都可能算出
+     * 负数金额→trade() 命中 amount<=0 免支付直发（平台货源商品还会让平台向上游代付=亏损）。空值放行
+     * （下游按 0 处理）。顶层 config 与 level_price 内层 config 两条路径共用本校验，避免任一处遗漏。
+     *
+     * @param array $config Ini::toArray() 解析后的配置
+     * @throws JSONException
+     */
+    public static function assertConfigPricesNonNegative(array $config): void
+    {
+        foreach (['category', 'wholesale', 'category_wholesale', 'sku'] as $section) {
+            if (!empty($config[$section]) && is_array($config[$section])) {
+                array_walk_recursive($config[$section], static function ($value): void {
+                    if ($value === '' || $value === null) {
+                        return;
+                    }
+                    if (!is_numeric($value) || (float)$value < 0) {
+                        throw new JSONException("商品价格配置必须是不小于0的数字哦(｡￫‿￩｡)");
+                    }
+                    if (!preg_match('/^\d+(\.\d{1,2})?$/', trim((string)$value))) {
+                        throw new JSONException("商品价格配置最多两位小数");
+                    }
+                });
             }
         }
     }
@@ -399,5 +467,22 @@ class Commodity extends Model
         }
 
         return false;
+    }
+
+    /**
+     * 会员价：留空 / 为 0 时回退到零售价。
+     *
+     * 登录用户一律按会员价计价（会员等级门槛从 0 起，人人都有等级），所以会员价忘填
+     * 就是 0；而订单金额 ≤0 会被判定为免费并立即发货——一个空字段就等于把商品白送，
+     * 且站长以游客身份自测时价格正常，很难察觉。这里统一回退到零售价，
+     * 下单计价与前台展示都走它，保证两边口径一致。
+     *
+     * 商品本来就是免费的（零售价也是 0）时回退结果仍为 0，不影响真正的免费商品。
+     */
+    public function memberPrice(): float
+    {
+        $userPrice = (float)$this->user_price;
+
+        return $userPrice > 0 ? $userPrice : (float)$this->price;
     }
 }

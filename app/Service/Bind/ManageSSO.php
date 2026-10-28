@@ -68,7 +68,7 @@ class ManageSSO implements \App\Service\ManageSSO
                         $failedAudit = [$manage, "登录待验证：密码正确，等待谷歌验证码"];
                         throw new JSONException("该账号已开启两步验证，请输入谷歌验证码", self::CODE_NEED_TOTP);
                     }
-                    if (!\App\Util\Totp::verify((string)$manage->google_secret, $code)) {
+                    if (!\App\Util\Totp::verifyAndConsume((string)$manage->google_secret, $code, "manage:" . (int)$manage->id)) {
                         $failedAudit = [$manage, "登录失败：谷歌验证码错误"];
                         throw new JSONException("谷歌验证码错误");
                     }
@@ -82,6 +82,14 @@ class ManageSSO implements \App\Service\ManageSSO
                 }
                 if ($manage->type == 3 && !Date::isNight()) {
                     throw new JSONException("您是夜班哦，请注意休息。");
+                }
+
+                //密码校验通过：旧格式哈希透明升级为 bcrypt。会话 JWT 以密码哈希为签名密钥，
+                //哈希一变，其它设备上用旧哈希签发的 cookie 立即失效，故一并吊销，保持设备列表如实。
+                if (Str::passwordNeedsUpgrade((string)$manage->password)) {
+                    $manage->password = Str::hashPassword($password);
+                    $manage->saveOrFail();
+                    ManageSessionManager::revokeAll((int)$manage->id);
                 }
 
                 $manage->last_login_time = $manage->login_time;
@@ -108,11 +116,72 @@ class ManageSSO implements \App\Service\ManageSSO
             throw $e;
         }
 
+        return $this->finalizeSession($login);
+    }
+
+    /**
+     * passkey(WebAuthn) 登入：断言已在控制器校验通过，这里只做与密码登入相同的
+     * 状态/班次检查、登录时间更新、会话签发与收尾（记录 + 下发 cookie）。
+     *
+     * @param Manage $manage 已通过断言校验的管理员
+     * @param bool $remember
+     * @return array
+     * @throws JSONException
+     */
+    public function issueForManage(Manage $manage, bool $remember = false): array
+    {
+        $login = DB::transaction(function () use ($manage, $remember): array {
+            $m = Manage::query()->where('id', (int)$manage->id)->lockForUpdate()->first();
+            if (!$m) {
+                throw new JSONException("账号不存在");
+            }
+            if ($m->status != 1) {
+                throw new JSONException("账号已被暂停使用");
+            }
+            if ($m->type == 2 && Date::isNight()) {
+                throw new JSONException("您是白班哦，请注意休息。");
+            }
+            if ($m->type == 3 && !Date::isNight()) {
+                throw new JSONException("您是夜班哦，请注意休息。");
+            }
+
+            $m->last_login_time = $m->login_time;
+            $m->last_login_ip = $m->login_ip;
+            $m->login_time = Date::current();
+            $m->login_ip = Client::getAddress();
+            $m->saveOrFail();
+
+            $expire = $remember ? 86400 * 365 : 86400;
+            $expiresAt = time() + $expire;
+            $issued = ManageSessionManager::issue($m, $expiresAt);
+
+            return [
+                'manage' => $m,
+                'expires_at' => $expiresAt,
+                'cookie' => $issued['cookie'],
+                'session_id' => (int)$issued['session']->id,
+            ];
+        });
+
+        return $this->finalizeSession($login, "使用通行密钥登录了后台");
+    }
+
+    /**
+     * 登入收尾：写审计日志（失败则补偿撤销已签发会话）、下发会话 cookie、触发登录后钩子。
+     * 密码登入与 passkey 登入共用。
+     *
+     * @param array{manage:Manage,expires_at:int,cookie:string,session_id:int} $login
+     * @param string $logText 审计日志文案
+     * @return array
+     * @throws JSONException
+     */
+    private function finalizeSession(array $login, string $logText = "登录了后台"): array
+    {
         // manage_log is MyISAM on existing installations. Writing it inside
         // the InnoDB login transaction violates MySQL GTID consistency after
         // the account/session rows have changed, so audit only after commit.
         try {
-            ManageLog::log($login['manage'], "登录了后台");
+            ManageLog::log($login['manage'], $logText);
         } catch (\Throwable) {
             // The cookie has not been sent yet. Revoke the committed session
             // so an audit failure cannot leave a valid, unreachable login.
@@ -134,7 +203,7 @@ class ManageSSO implements \App\Service\ManageSSO
             'path' => '/',
             'httponly' => true,               //禁止 JS 读取会话 Cookie（防 XSS 窃取/日志泄露复用）
             'samesite' => 'Lax',              //防 CSRF：跨站请求不携带后台会话
-            'secure' => (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off'),
+            'secure' => Client::isSecureRequest(),
         ]);
 
         //登录成功通知点位（会话已签发；钩子异常不影响登录结果）

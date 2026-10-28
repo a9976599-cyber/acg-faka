@@ -106,8 +106,10 @@ class Category extends Manage
             }
         }
 
-        $selected = array_fill_keys($requestedIds, true);
-        $visited = $selected;
+        //删一个分类就意味着它下面整棵子树都没了（category.pid 的外键本来就是 ON DELETE
+        //CASCADE）。以前把「未被选中的下级分类」当成拦截理由，等于让站长先手工把子树
+        //一层层删干净才准动父分类——现在直接把整棵子树纳入删除范围，如实报数。
+        $visited = array_fill_keys($requestedIds, true);
         $queue = $requestedIds;
         while ($queue !== []) {
             $id = array_shift($queue);
@@ -119,12 +121,14 @@ class Category extends Manage
                 $queue[] = $childId;
             }
         }
-        $unselectedDescendantIds = array_values(array_diff(array_map('intval', array_keys($visited)), $requestedIds));
-        sort($unselectedDescendantIds, SORT_NUMERIC);
+        $scopeIds = array_map('intval', array_keys($visited));
+        sort($scopeIds, SORT_NUMERIC);
+        $descendantIds = array_values(array_diff($scopeIds, $requestedIds));
+        sort($descendantIds, SORT_NUMERIC);
 
-        // Resolve explicit leaf-to-root batches so the self-FK cascade cannot
-        // expand the selected scope.
-        $remaining = $selected;
+        //叶子在前逐层删。环形脏数据（A 的父是 B、B 的父是 A）排不出层级，
+        //留给 del() 最后那一发按 id 集合的兜底删除收拾，不再作为拦截理由。
+        $remaining = array_fill_keys($scopeIds, true);
         $deleteLevels = [];
         while ($remaining !== []) {
             $leaves = [];
@@ -152,23 +156,33 @@ class Category extends Manage
         $hierarchyCycleCount = count($remaining);
 
         $categoryEdges = [];
-        foreach ($requestedIds as $id) {
+        foreach ($scopeIds as $id) {
             $categoryEdges[$id] = (int)$existing[$id];
         }
         ksort($categoryEdges, SORT_NUMERIC);
 
         $commodityQuery = \App\Model\Commodity::query()
-            ->whereIn('category_id', $requestedIds)
+            ->whereIn('category_id', $scopeIds)
             ->select(['id', 'category_id']);
         if ($lock) {
             $commodityQuery->lockForUpdate();
         }
-        $commodities = $commodityQuery->get();
-        $commodityIds = $commodities->pluck('id')->map(static fn($id): int => (int)$id)->all();
+        $commodityIds = $commodityQuery->get()->pluck('id')->map(static fn($id): int => (int)$id)->all();
         sort($commodityIds, SORT_NUMERIC);
 
+        //商品是连着订单/工单/卡密一起清的（与「删商品」同口径，见 Util\CommodityPurge）。
+        //数出来只为了让确认弹窗把代价说清楚，不是为了拦人。
+        $orderCount = 0;
+        $cardCount = 0;
+        if ($commodityIds !== []) {
+            $orderCount = \App\Model\Order::query()->whereIn('commodity_id', $commodityIds)->count();
+            $cardCount = \App\Model\Card::query()->whereIn('commodity_id', $commodityIds)->count();
+        }
+
+        //只绑分类、不绑商品的优惠券：分类没了它就永远用不出去。清成「全场通用」等于
+        //偷偷放大它的适用范围（真金白银），所以跟着分类一起删。
         $couponQuery = \App\Model\Coupon::query()
-            ->whereIn('category_id', $requestedIds)
+            ->whereIn('category_id', $scopeIds)
             ->select(['id', 'status', 'trade_no']);
         if ($lock) {
             $couponQuery->lockForUpdate();
@@ -178,7 +192,7 @@ class Category extends Manage
         sort($couponIds, SORT_NUMERIC);
 
         $userCategoryQuery = \App\Model\UserCategory::query()
-            ->whereIn('category_id', $requestedIds)
+            ->whereIn('category_id', $scopeIds)
             ->select('id');
         if ($lock) {
             $userCategoryQuery->lockForUpdate();
@@ -190,72 +204,36 @@ class Category extends Manage
         // application writer barrier around this snapshot and the transaction.
         $configReferences = \App\Model\Config::query()
             ->where('key', 'default_category')
-            ->whereIn('value', array_map('strval', $requestedIds))
+            ->whereIn('value', array_map('strval', $scopeIds))
             ->get(['id', 'value']);
         $configReferenceIds = $configReferences->pluck('id')->map(static fn($id): int => (int)$id)->all();
         sort($configReferenceIds, SORT_NUMERIC);
 
-        // ThirdDockManage stores its target category inside a serialized rule
-        // payload instead of a foreign-key column. The plugin may be disabled
-        // while its table and rules still remain, so core category deletion
-        // must protect those references without booting or enabling the plugin.
-        $thirdDockRuleIds = [];
-        try {
-            if (DB::schema()->hasTable('third_dock_rules')) {
-                $thirdDockRuleQuery = DB::table('third_dock_rules')->select(['id', 'settings']);
-                if ($lock) {
-                    $thirdDockRuleQuery->lockForUpdate();
-                }
-                $categoryLookup = array_fill_keys($requestedIds, true);
-                foreach ($thirdDockRuleQuery->get() as $rule) {
-                    $settings = @unserialize((string)($rule->settings ?? ''), ['allowed_classes' => false]);
-                    if (is_array($settings)
-                        && isset($settings['category_id'])
-                        && is_numeric($settings['category_id'])
-                        && isset($categoryLookup[(int)$settings['category_id']])) {
-                        $thirdDockRuleIds[] = (int)$rule->id;
-                    }
-                }
-                $thirdDockRuleIds = array_values(array_unique($thirdDockRuleIds));
-                sort($thirdDockRuleIds, SORT_NUMERIC);
-            }
-        } catch (\Throwable) {
-            // Failing open here could leave a disabled plugin rule pointing at
-            // a physically deleted category. Make the destructive operation
-            // unavailable until the reference check can be completed.
-            throw new JSONException('无法检查 ThirdDockManage 分类引用，已阻止删除');
-        }
-
-        $blockerCount = count($unselectedDescendantIds)
-            + $hierarchyCycleCount
-            + count($commodityIds)
-            + count($couponIds)
-            + count($userCategoryIds)
-            + count($configReferenceIds)
-            + count($thirdDockRuleIds);
-
         return [
             // Internal snapshot fields; deleteImpact() removes these from JSON.
             'category_ids' => $requestedIds,
+            'scope_ids' => $scopeIds,
             'category_edges' => $categoryEdges,
             'delete_levels' => $deleteLevels,
-            'unselected_descendant_ids' => $unselectedDescendantIds,
+            'descendant_ids' => $descendantIds,
             'commodity_ids' => $commodityIds,
             'coupon_ids' => $couponIds,
             'user_category_ids' => $userCategoryIds,
             'config_reference_ids' => $configReferenceIds,
-            'third_dock_rule_ids' => $thirdDockRuleIds,
 
             'category_count' => count($requestedIds),
-            'unselected_descendant_count' => count($unselectedDescendantIds),
+            'scope_count' => count($scopeIds),
+            'descendant_count' => count($descendantIds),
             'hierarchy_cycle_count' => $hierarchyCycleCount,
             'commodity_count' => count($commodityIds),
+            'order_count' => $orderCount,
+            'card_count' => $cardCount,
             'coupon_count' => count($couponIds),
             'used_coupon_count' => $coupons->filter(static fn($coupon): bool => (int)$coupon->status === 1 || trim((string)$coupon->trade_no) !== '')->count(),
             'user_category_count' => count($userCategoryIds),
             'config_reference_count' => count($configReferenceIds),
-            'third_dock_rule_count' => count($thirdDockRuleIds),
-            'can_delete' => $blockerCount === 0,
+            //站长要删就删。这个字段只为兼容老前端而保留，永远是 true。
+            'can_delete' => true,
         ];
     }
 
@@ -264,8 +242,8 @@ class Category extends Manage
     {
         $snapshot = [];
         foreach ([
-            'category_ids', 'category_edges', 'delete_levels', 'unselected_descendant_ids', 'commodity_ids',
-            'coupon_ids', 'user_category_ids', 'config_reference_ids', 'third_dock_rule_ids',
+            'category_ids', 'scope_ids', 'category_edges', 'delete_levels', 'descendant_ids', 'commodity_ids',
+            'coupon_ids', 'user_category_ids', 'config_reference_ids',
         ] as $key) {
             $snapshot[$key] = $impact[$key] ?? [];
         }
@@ -364,7 +342,9 @@ class Category extends Manage
         $map = $_POST;
         $get = new Get(\App\Model\Category::class);
         $get->setWhere($map);
-        $get->setOrderBy(...$this->query->getOrderBy($map, "sort", "asc"));
+        //分类是树、支持拖动排序：列表必须永远按真实顺序（sort 升序）出，不接受前端改排序方向——
+        //否则拖动时看到的顺序和写进库的顺序对不上。
+        $get->setOrderBy("sort", "asc");
         $data = $this->query->get($get, function (Builder $builder) use ($map) {
             if (isset($map['user_id']) && $map['user_id'] > 0) {
                 $builder = $builder->where("owner", $map['user_id']);
@@ -377,11 +357,66 @@ class Category extends Manage
             }]);
         });
 
+        //分类不分页，全量在内存里排（代价可以忽略）：
+        //1. sort 相同的分类数据库不保证先后，每次刷新可能换位置，拖动排序据此算出的新顺序也跟着不稳定——按 id 补一个稳定次序；
+        //2. 按「父级在前、下级紧跟其后」的深度优先顺序出。电脑版树形表格自己会按层级重排行，但手机版卡片列表是按返回顺序直接画的：
+        //   不这样排，下级会跑到父级前面、和别的分类穿插，长按拖动时同级也不挨在一起。
+        $data['list'] = $this->treeOrder($data['list']);
+
         foreach ($data['list'] as &$item) {
             $item['share_url'] = Client::getUrl() . "/cat/{$item['id']}";
         }
 
         return $this->json(data: $data);
+    }
+
+    /**
+     * 分类树按深度优先排列：同级按 sort、id 升序，每个分类后面紧跟它的全部下级。
+     * 父级不在结果里的（按名称 / 状态筛掉了，或数据本身有问题）当顶级处理；互为父级的脏数据补在最后，不让它从列表里消失。
+     * @param array $rows
+     * @return array
+     */
+    private function treeOrder(array $rows): array
+    {
+        usort($rows, static fn(array $a, array $b): int
+            => [(int)$a['sort'], (int)$a['id']] <=> [(int)$b['sort'], (int)$b['id']]);
+
+        $present = [];
+        foreach ($rows as $row) {
+            $present[(int)$row['id']] = true;
+        }
+
+        $roots = [];
+        $children = [];
+        foreach ($rows as $row) {
+            $pid = (int)($row['pid'] ?? 0);
+            if ($pid > 0 && $pid !== (int)$row['id'] && isset($present[$pid])) {
+                $children[$pid][] = $row;
+            } else {
+                $roots[] = $row;
+            }
+        }
+
+        $ordered = [];
+        $visited = [];
+        $walk = static function (array $row) use (&$walk, &$ordered, &$visited, $children): void {
+            $id = (int)$row['id'];
+            if (isset($visited[$id])) {
+                return;
+            }
+            $visited[$id] = true;
+            $ordered[] = $row;
+            foreach ($children[$id] ?? [] as $child) {
+                $walk($child);
+            }
+        };
+        foreach ($roots as $row) {
+            $walk($row);
+        }
+        foreach ($rows as $row) {
+            $walk($row);
+        }
+        return $ordered;
     }
 
 
@@ -417,6 +452,10 @@ class Category extends Manage
                 throw new JSONException("分类状态参数不正确");
             }
             $map[$booleanField] = (int)$value;
+        }
+        //排序没填：修改时保持原值，新增时排到同级最后（见下方）。弹窗里排序框留空会提交空字符串，不能当成非法值拒绝
+        if (array_key_exists('sort', $map) && trim((string)$map['sort']) === '') {
+            unset($map['sort']);
         }
         if (isset($map['sort'])) {
             $sort = filter_var($map['sort'], FILTER_VALIDATE_INT);
@@ -459,8 +498,24 @@ class Category extends Manage
             }
         }
 
+        //新增且没填排序：排到同级最后。拖动排序会把同级写成 0..n-1，默认 0 会插到第一、二位之间
+        if ($id === 0 && !isset($map['sort'])) {
+            $siblingQuery = \App\Model\Category::query()->where('owner', 0);
+            if ($parentId > 0) {
+                $siblingQuery->where('pid', $parentId);
+            } else {
+                $siblingQuery->where(function ($query) {
+                    $query->whereNull('pid')->orWhere('pid', 0);
+                });
+            }
+            $maxSort = $siblingQuery->max('sort');
+            $map['sort'] = $maxSort === null ? 0 : min(65535, (int)$maxSort + 1);
+        }
+
         unset($map['pid']);
         $save = new Save(\App\Model\Category::class);
+        //图标是可选字段，允许清空（移除分类图标）；其余字段维持"留空=不修改"
+        $save->allowEmpty = ['icon'];
         $save->setMap($map, $allowed);
         if ($hasParent) {
             $save->addForceMap('pid', $parentId > 0 ? $parentId : null);
@@ -476,6 +531,64 @@ class Category extends Manage
 
         ManageLog::log($this->getManage(), "[新增/修改]商品分类");
         return $this->json(200, '（＾∀＾）保存成功');
+    }
+
+
+    /**
+     * 拖动排序：前端把「同一父级下的全部同级分类」按新顺序整组提交，按顺序重写 sort（0,1,2…）。
+     *
+     * 只收**完整的一组同级分类**：缺了、多了、混进别的父级或别的创建者一律拒绝。前端看到的列表
+     * 可能已经过期（另一个管理员刚新增/删除/挪动了分类），这时宁可让它刷新重来——只重写一部分
+     * 同级的 sort，会和没提交的那几个撞号，前台顺序就乱了。
+     *
+     * @return array
+     * @throws JSONException
+     */
+    public function reorder(): array
+    {
+        $ids = $this->categoryIds($_POST['list'] ?? []);
+        if (count($ids) < 2) {
+            throw new JSONException('至少需要两个同级分类才能调整顺序');
+        }
+
+        $rows = \App\Model\Category::query()->whereIn('id', $ids)->get(['id', 'pid', 'owner']);
+        if ($rows->count() !== count($ids)) {
+            throw new JSONException('部分分类已不存在，请刷新后再调整顺序');
+        }
+
+        $owner = (int)$rows->first()->owner;
+        $pid = (int)$rows->first()->pid;
+        foreach ($rows as $row) {
+            if ((int)$row->owner !== $owner || (int)$row->pid !== $pid) {
+                throw new JSONException('只能在同一个父级分类下调整顺序');
+            }
+        }
+
+        //顶级分类的 pid 历史上有 NULL 和 0 两种写法（save() 现在写 NULL），两种都算顶级
+        $siblingQuery = \App\Model\Category::query()->where('owner', $owner);
+        if ($pid > 0) {
+            $siblingQuery->where('pid', $pid);
+        } else {
+            $siblingQuery->where(function ($query) {
+                $query->whereNull('pid')->orWhere('pid', 0);
+            });
+        }
+        $siblingIds = array_map('intval', $siblingQuery->pluck('id')->all());
+        $submitted = $ids;
+        sort($siblingIds, SORT_NUMERIC);
+        sort($submitted, SORT_NUMERIC);
+        if ($siblingIds !== $submitted) {
+            throw new JSONException('同级分类已发生变化，请刷新后再调整顺序');
+        }
+
+        DB::transaction(function () use ($ids) {
+            foreach ($ids as $position => $id) {
+                \App\Model\Category::query()->where('id', $id)->update(['sort' => $position]);
+            }
+        });
+
+        ManageLog::log($this->getManage(), "[拖动排序]商品分类，同级 " . count($ids) . " 个");
+        return $this->json(200, '排序已保存');
     }
 
 
@@ -498,28 +611,69 @@ class Category extends Manage
                 if (!hash_equals((string)$preview['snapshot'], $this->categoryImpactFingerprint($impact))) {
                     throw new JSONException('分类或业务引用在预览后发生变化，未执行删除，请重新预览');
                 }
-                if (!$impact['can_delete']) {
-                    throw new JSONException('分类存在子分类或业务引用，已阻止删除');
+
+                //站长选了删除、又在弹窗里确认过代价，这里就只负责把它删干净。
+                //引用一律清理，不再有任何一条「因为还有 X 所以不给删」。
+
+                //① 分类内商品：与「删商品」完全同一口径，订单/工单/卡密/优惠券一并清
+                if ($impact['commodity_ids'] !== []) {
+                    \App\Util\CommodityPurge::cascade($impact['commodity_ids']);
+                    \App\Model\Commodity::query()->whereIn('id', $impact['commodity_ids'])->delete();
                 }
 
-                $deletedCategories = 0;
+                //② 只绑分类的优惠券（绑了商品的已在上一步随商品清掉）
+                if ($impact['coupon_ids'] !== []) {
+                    \App\Model\Coupon::query()->whereIn('id', $impact['coupon_ids'])->delete();
+                }
+
+                //③ 商户分类映射：user_category.category_id 的外键本就是 ON DELETE CASCADE，
+                //   但老库不一定有这条外键，显式再删一遍，两种库行为一致
+                \App\Model\UserCategory::query()->whereIn('category_id', $impact['scope_ids'])->delete();
+
+                //④ 插件自己的引用（序列化配置里的 category_id 这类，核心扫不到）。
+                //   插件抛异常只记日志：站长要删分类，插件没有否决权。
+                $categoryIds = $impact['scope_ids'];
+                try {
+                    hook(\App\Consts\Hook::CATEGORY_DELETE_BEFORE, $categoryIds);
+                } catch (\Throwable $e) {
+                    \Kernel\Util\Log::inst()->error('分类删除钩子处理失败，已忽略并继续删除：' . $e->getMessage());
+                }
+
+                //⑤ 分类本体：叶子在前逐层删
                 foreach ($impact['delete_levels'] as $ids) {
-                    $deletedCategories += \App\Model\Category::query()->whereIn('id', $ids)->delete();
+                    \App\Model\Category::query()->whereIn('id', $ids)->delete();
                 }
-                if ($deletedCategories !== $impact['category_count']) {
-                    throw new JSONException('分类层级发生变化，未执行删除，请重新预览');
-                }
+                //环形父子这类脏数据排不出层级，兜底按整个范围再删一次
+                \App\Model\Category::query()->whereIn('id', $impact['scope_ids'])->delete();
+
                 return $impact;
             });
         });
 
+        if ($impact['commodity_ids'] !== []) {
+            \App\Util\CardFile\Purge::sweepOrphans();
+        }
+
+        //默认分类指向了被删掉的分类：事务提交后清空并重建配置缓存
+        //（放在事务外是因为 Config::putMany 会重写 runtime/config，那不是事务的一部分）
+        if ($impact['config_reference_ids'] !== []) {
+            try {
+                \App\Model\Config::put('default_category', '');
+            } catch (\Throwable $e) {
+                \Kernel\Util\Log::inst()->error('清空网站默认分类失败：' . $e->getMessage());
+            }
+        }
+
         ManageLog::log(
             $this->getManage(),
-            "[删除]空商品分类，分类：{$impact['category_count']}"
+            "[删除]商品分类：{$impact['scope_count']}（含下级 {$impact['descendant_count']}）"
+            . "，连带商品：{$impact['commodity_count']}，订单：{$impact['order_count']}，优惠券：{$impact['coupon_count']}"
         );
         return $this->json(200, '（＾∀＾）移除成功', [
-            'category_count' => $impact['category_count'],
-            'commodity_count' => 0,
+            'category_count' => $impact['scope_count'],
+            'commodity_count' => $impact['commodity_count'],
+            'order_count' => $impact['order_count'],
+            'coupon_count' => $impact['coupon_count'],
         ]);
     }
 
@@ -532,20 +686,21 @@ class Category extends Manage
     {
         $requestedIds = $this->categoryIds($_POST['list'] ?? []);
         $impact = $this->safeCategoryDeleteImpact($requestedIds);
-        $token = $impact['can_delete'] ? $this->issueCategoryDeleteToken($requestedIds, $impact) : null;
+        //预览一律发凭证：它的作用是「确认你看到的就是要删的」，不是准入门槛
+        $token = $this->issueCategoryDeleteToken($requestedIds, $impact);
         unset(
             $impact['category_ids'],
+            $impact['scope_ids'],
             $impact['category_edges'],
             $impact['delete_levels'],
-            $impact['unselected_descendant_ids'],
+            $impact['descendant_ids'],
             $impact['commodity_ids'],
             $impact['coupon_ids'],
             $impact['user_category_ids'],
-            $impact['config_reference_ids'],
-            $impact['third_dock_rule_ids']
+            $impact['config_reference_ids']
         );
         $impact['preview_token'] = $token;
-        $impact['preview_expires_in'] = $token === null ? 0 : 180;
+        $impact['preview_expires_in'] = 180;
         return $this->json(data: $impact);
     }
 
